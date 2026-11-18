@@ -316,8 +316,6 @@ fn nwpu_html(text: &str, monday: NaiveDate, campus: Campus) -> Result<Entries> {
     )
     .map_err(|error| error.to_string())?;
     let teacher_re = Regex::new(r"授课教师：\s*([^<]+)").map_err(|error| error.to_string())?;
-    let week_re = Regex::new(r"(?i)(\d{1,2})(?:\s*[~～-]\s*(\d{1,2}))?\s*周")
-        .map_err(|error| error.to_string())?;
     let day_re = Regex::new(r"周([一二三四五六日天])").map_err(|error| error.to_string())?;
     let period_re = Regex::new(
         r"第([一二三四五六七八九十百]+)节(?:\s*[~～-]\s*第([一二三四五六七八九十百]+)节)?",
@@ -360,21 +358,14 @@ fn nwpu_html(text: &str, monday: NaiveDate, campus: Campus) -> Result<Entries> {
             .filter(|part| !part.is_empty())
         {
             let plain = html_text(part);
-            let (week_start, week_end) = week_re
+            let day_capture = day_re
                 .captures(&plain)
-                .and_then(|capture| {
-                    let start = capture.get(1)?.as_str().parse::<u32>().ok()?;
-                    let end = capture
-                        .get(2)
-                        .and_then(|value| value.as_str().parse::<u32>().ok())
-                        .unwrap_or(start);
-                    Some((start, end))
-                })
-                .ok_or_else(|| format!("课程「{title}」缺少周次：{plain}"))?;
-            let day = day_re
-                .captures(&plain)
-                .and_then(|capture| chinese_day(&capture[1]))
                 .ok_or_else(|| format!("课程「{title}」缺少星期：{plain}"))?;
+            let day = chinese_day(&day_capture[1])
+                .ok_or_else(|| format!("课程「{title}」缺少星期：{plain}"))?;
+            let weeks_text = &plain[..day_capture.get(0).map_or(0, |found| found.start())];
+            let weeks = week_numbers(weeks_text)
+                .map_err(|error| format!("课程「{title}」{error}：{plain}"))?;
             let (first, last) = period_re
                 .captures(&plain)
                 .and_then(|capture| {
@@ -402,7 +393,7 @@ fn nwpu_html(text: &str, monday: NaiveDate, campus: Campus) -> Result<Entries> {
                     .unwrap()
                     .with_timezone(&Utc)
             };
-            for week in week_start..=week_end {
+            for week in weeks {
                 let date = monday
                     .checked_add_signed(Duration::days(i64::from((week - 1) * 7 + day)))
                     .ok_or("西工大课表日期超出有效范围")?;
@@ -854,6 +845,34 @@ SUMMARY:调课\r\nLOCATION:教 B102\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     }
 
     #[test]
+    fn nwpu_html_expands_comma_separated_week_segments() {
+        let text = r#"<table><tr class="lessonInfo">
+          <td class="courseInfo" data-course="High Performance Computing[M10E22003]">
+            <p class="showSchedules">High Performance Computing</p>
+            <p>M10E22003</p>
+            <p>王云岚(2004000149)</p>
+          </td>
+          <td class="text"><p class="inner">1-2节</p></td>
+          <td>11~16,18~19周 周三 第七节~第十节 长安校区 教西D-301</td>
+        </tr></table>"#;
+        let monday = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+        let entries = html(text.as_bytes(), monday, Campus::Changan).unwrap();
+        let mut dates: Vec<_> = entries
+            .values()
+            .map(|entry| entry.start.unwrap().date_naive().to_string())
+            .collect();
+        dates.sort();
+        assert_eq!(
+            dates,
+            [
+                "2026-11-11", "2026-11-18", "2026-11-25", "2026-12-02", "2026-12-09",
+                "2026-12-16", "2026-12-30", "2027-01-06",
+            ]
+        );
+        assert!(entries.values().all(|entry| entry.title == "High Performance Computing"));
+    }
+
+    #[test]
     fn optional_real_nwpu_html_smoke() {
         let Ok(path) = std::env::var("COURSE_CLOCK_REAL_HTML") else {
             return;
@@ -861,7 +880,7 @@ SUMMARY:调课\r\nLOCATION:教 B102\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         let bytes = std::fs::read(path).unwrap();
         let entries = html(
             &bytes,
-            NaiveDate::from_ymd_opt(2026, 9, 7).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 31).unwrap(),
             Campus::Changan,
         )
         .unwrap();
