@@ -1314,6 +1314,22 @@ impl App {
             Action::ParseImport => self.open_preview()?,
             Action::CommitImport => {
                 let mut entries = self.state.entries.clone();
+                let stale: Vec<Uuid> = entries
+                    .iter()
+                    .filter(|(_, old)| {
+                        old.kind == Kind::Course
+                            && self.preview.values().any(|fresh| {
+                                fresh.start == old.start
+                                    && old.title != fresh.title
+                                    && old.title.trim_start_matches("研究生").trim()
+                                        == fresh.title.trim()
+                            })
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in &stale {
+                    entries.remove(id);
+                }
                 let mut count = 0;
                 for (&id, source) in &self.preview {
                     let mut entry = source.clone();

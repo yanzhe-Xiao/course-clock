@@ -315,6 +315,10 @@ fn nwpu_html(text: &str, monday: NaiveDate, campus: Campus) -> Result<Entries> {
         r#"(?is)<p\b[^>]*class\s*=\s*["'][^"']*\bshowSchedules\b[^"']*["'][^>]*>(.*?)</p>"#,
     )
     .map_err(|error| error.to_string())?;
+    let cultivate_re = Regex::new(
+        r#"(?is)<span\b[^>]*class\s*=\s*["'][^"']*\bcultivate-sign\b[^"']*["'][^>]*>.*?</span>"#,
+    )
+    .map_err(|error| error.to_string())?;
     let teacher_re = Regex::new(r"授课教师：\s*([^<]+)").map_err(|error| error.to_string())?;
     let day_re = Regex::new(r"周([一二三四五六日天])").map_err(|error| error.to_string())?;
     let period_re = Regex::new(
@@ -337,7 +341,7 @@ fn nwpu_html(text: &str, monday: NaiveDate, campus: Campus) -> Result<Entries> {
         }
         let title = title_re
             .captures(row)
-            .map(|capture| html_text(&capture[1]))
+            .map(|capture| html_text(&cultivate_re.replace_all(&capture[1], " ")))
             .filter(|title| !title.is_empty())
             .or_else(|| {
                 course_code.map(|code| code.split('[').next().unwrap_or(code).trim().to_string())
@@ -848,7 +852,7 @@ SUMMARY:调课\r\nLOCATION:教 B102\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     fn nwpu_html_expands_comma_separated_week_segments() {
         let text = r#"<table><tr class="lessonInfo">
           <td class="courseInfo" data-course="High Performance Computing[M10E22003]">
-            <p class="showSchedules">High Performance Computing</p>
+            <p class="showSchedules"><span class="cultivate-sign">研究生</span>High Performance Computing</p>
             <p>M10E22003</p>
             <p>王云岚(2004000149)</p>
           </td>
@@ -865,11 +869,21 @@ SUMMARY:调课\r\nLOCATION:教 B102\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         assert_eq!(
             dates,
             [
-                "2026-11-11", "2026-11-18", "2026-11-25", "2026-12-02", "2026-12-09",
-                "2026-12-16", "2026-12-30", "2027-01-06",
+                "2026-11-11",
+                "2026-11-18",
+                "2026-11-25",
+                "2026-12-02",
+                "2026-12-09",
+                "2026-12-16",
+                "2026-12-30",
+                "2027-01-06",
             ]
         );
-        assert!(entries.values().all(|entry| entry.title == "High Performance Computing"));
+        assert!(
+            entries
+                .values()
+                .all(|entry| entry.title == "High Performance Computing")
+        );
     }
 
     #[test]

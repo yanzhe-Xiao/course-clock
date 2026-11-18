@@ -824,16 +824,23 @@ fn draw_week_grid(
             if conflict { p.danger } else { ink },
         );
         if block_height >= 22 {
-            let title_lines = ((block_height - 4) / 16).clamp(1, 3);
+            let line = 16;
+            let footer = if block_height >= 54 { 18 } else { 0 };
+            let title_lines = ((block_height - 8 - footer) / line).clamp(1, 4);
             f.wrap(
-                Bounds(bounds.0 + 9, bounds.1 + 4, bounds.2 - 14, block_height - 6),
+                Bounds(
+                    bounds.0 + 9,
+                    bounds.1 + 4,
+                    bounds.2 - 14,
+                    title_lines * line,
+                ),
                 &entry.title,
                 11,
                 700,
                 p.text,
                 title_lines,
             );
-            if block_height >= 54 {
+            if footer > 0 {
                 f.text(
                     Bounds(bounds.0 + 9, bounds.1 + block_height - 20, bounds.2 - 14, 18),
                     &entry.time_label(),
