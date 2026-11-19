@@ -103,6 +103,11 @@ pub struct Entry {
 }
 
 impl Entry {
+    pub fn course_end(&self) -> Option<DateTime<Utc>> {
+        self.end
+            .or_else(|| self.start.map(|start| start + Duration::minutes(45)))
+    }
+
     pub fn validates(&self) -> bool {
         !self.title.trim().is_empty()
             && self.title.chars().count() <= 300
@@ -197,6 +202,10 @@ impl State {
 pub fn local_time(text: &str) -> Result<DateTime<Utc>> {
     let naive = NaiveDateTime::parse_from_str(text.trim(), "%Y-%m-%d %H:%M")
         .map_err(|_| "请输入日期和时间，例如 2026-11-18 08:30".to_string())?;
+    local_datetime(naive)
+}
+
+pub fn local_datetime(naive: NaiveDateTime) -> Result<DateTime<Utc>> {
     Local
         .from_local_datetime(&naive)
         .single()
@@ -281,7 +290,7 @@ pub fn overlapping(entries: &Entries, date: NaiveDate) -> BTreeSet<Uuid> {
             (entry.kind == Kind::Course && local.date_naive() == date).then_some((
                 *id,
                 start,
-                entry.end.unwrap_or(start + Duration::minutes(45)),
+                entry.course_end()?,
             ))
         })
         .collect();

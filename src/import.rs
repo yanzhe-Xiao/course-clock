@@ -325,8 +325,6 @@ fn nwpu_html(text: &str, monday: NaiveDate, campus: Campus) -> Result<Entries> {
         r"第([一二三四五六七八九十百]+)节(?:\s*[~～-]\s*第([一二三四五六七八九十百]+)节)?",
     )
     .map_err(|error| error.to_string())?;
-    let place_re =
-        Regex::new(r"((?:长安|友谊)校区(?:\s+\S+)?)").map_err(|error| error.to_string())?;
     let schedule_separator = Regex::new(r"(?is)<br\s*/?>|;").map_err(|error| error.to_string())?;
     let mut entries = Entries::new();
     let slots = campus.slots();
@@ -370,7 +368,7 @@ fn nwpu_html(text: &str, monday: NaiveDate, campus: Campus) -> Result<Entries> {
             let weeks_text = &plain[..day_capture.get(0).map_or(0, |found| found.start())];
             let weeks = week_numbers(weeks_text)
                 .map_err(|error| format!("课程「{title}」{error}：{plain}"))?;
-            let (first, last) = period_re
+            let (first, last, period_end) = period_re
                 .captures(&plain)
                 .and_then(|capture| {
                     let first = chinese_number(&capture[1])?;
@@ -378,16 +376,17 @@ fn nwpu_html(text: &str, monday: NaiveDate, campus: Campus) -> Result<Entries> {
                         .get(2)
                         .and_then(|value| chinese_number(value.as_str()))
                         .unwrap_or(first);
-                    Some((first, last))
+                    Some((first, last, capture.get(0)?.end()))
                 })
                 .ok_or_else(|| format!("课程「{title}」缺少节次：{plain}"))?;
             if first == 0 || last < first || last > slots.len() {
                 return Err(format!("课程「{title}」节次超出所选校区作息范围"));
             }
-            let place = place_re
-                .captures(&plain)
-                .map(|capture| capture[1].trim().to_string())
-                .unwrap_or_default();
+            let place = plain[period_end..]
+                .trim_start_matches(|c: char| {
+                    c.is_whitespace() || matches!(c, ':' | '：' | ',' | '，')
+                })
+                .to_string();
             let china = FixedOffset::east_opt(8 * 3600).unwrap();
             let at = |date: NaiveDate, time: &str| {
                 let time = NaiveTime::parse_from_str(time, "%H:%M").expect("school timetable");
@@ -857,7 +856,7 @@ SUMMARY:调课\r\nLOCATION:教 B102\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             <p>王云岚(2004000149)</p>
           </td>
           <td class="text"><p class="inner">1-2节</p></td>
-          <td>11~16,18~19周 周三 第七节~第十节 长安校区 教西D-301</td>
+          <td>11~16,18~19周 周三 第七节~第十节 长安校区 教西 D-301</td>
         </tr></table>"#;
         let monday = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
         let entries = html(text.as_bytes(), monday, Campus::Changan).unwrap();
@@ -882,7 +881,8 @@ SUMMARY:调课\r\nLOCATION:教 B102\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
         assert!(
             entries
                 .values()
-                .all(|entry| entry.title == "High Performance Computing")
+                .all(|entry| entry.title == "High Performance Computing"
+                    && entry.place == "长安校区 教西 D-301")
         );
     }
 

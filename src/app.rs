@@ -6,7 +6,7 @@ use std::{
     sync::mpsc::{self, Receiver},
 };
 
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, Months, NaiveDate, Timelike, Utc};
 use uuid::Uuid;
 use windows_sys::Win32::{
     Foundation::{
@@ -31,13 +31,17 @@ use crate::{
     import::{self, Campus},
     model::{self, Alarm, DavSettings, Entries, Entry, Kind, RepeatRule, Result, Semester, State},
     sync::{self, Synced},
-    ui::{self, Action, Bounds, Field, Hit, Page, Palette, View},
+    ui::{
+        self, Action, Bounds, EntryTime, Field, Hit, Page, Palette, Picker, PickerKind, Scrollbar,
+        View,
+    },
     win::{self, wide},
 };
 
 const CONTROLLER: &str = "CourseClock.Controller.01";
 const MAIN: &str = "CourseClock.Main.01";
 const TOAST: &str = "CourseClock.Reminder.01";
+const PICKER: &str = "CourseClock.Picker.01";
 const TRAY: u32 = WM_APP + 1;
 const ACTIVATE: u32 = WM_APP + 2;
 const SYNC_DONE: u32 = WM_APP + 3;
@@ -84,6 +88,7 @@ pub fn run() -> Result<()> {
     register(CONTROLLER, Some(controller), icon, 0)?;
     register(MAIN, Some(main_proc), icon, 0)?;
     register(TOAST, Some(toast_proc), icon, CS_DROPSHADOW)?;
+    register(PICKER, Some(picker_proc), icon, CS_DROPSHADOW)?;
     let controller = create(
         CONTROLLER,
         &title,
@@ -116,11 +121,21 @@ pub fn run() -> Result<()> {
         page: Page::Today,
         day: today,
         scroll: 0,
+        week_scroll: None,
+        detail_scroll: 0,
+        scrollbar: None,
+        scroll_drag: None,
         main_hits: Vec::new(),
         toast_hits: Vec::new(),
         hover: None,
         toast_hover: None,
         input: Vec::new(),
+        entry_times: None,
+        picker: None,
+        picker_window: null_mut(),
+        picker_hits: Vec::new(),
+        picker_hover: None,
+        picker_focus: None,
         selects: Vec::new(),
         input_font: null_mut(),
         brush: null_mut(),
@@ -128,6 +143,7 @@ pub fn run() -> Result<()> {
         editing_kind: Kind::Task,
         editing_before: None,
         return_page: Page::Today,
+        course_origin: Page::Today,
         import_file: None,
         preview: Entries::new(),
         pending_semester: None,
@@ -205,11 +221,21 @@ struct App {
     page: Page,
     day: NaiveDate,
     scroll: usize,
+    week_scroll: Option<i32>,
+    detail_scroll: i32,
+    scrollbar: Option<Scrollbar>,
+    scroll_drag: Option<i32>,
     main_hits: Vec<Hit>,
     toast_hits: Vec<Hit>,
     hover: Option<Action>,
     toast_hover: Option<Action>,
     input: Vec<HWND>,
+    entry_times: Option<[EntryTime; 2]>,
+    picker: Option<Picker>,
+    picker_window: HWND,
+    picker_hits: Vec<Hit>,
+    picker_hover: Option<Action>,
+    picker_focus: Option<Action>,
     selects: Vec<usize>,
     input_font: HFONT,
     brush: HBRUSH,
@@ -217,6 +243,7 @@ struct App {
     editing_kind: Kind,
     editing_before: Option<Entry>,
     return_page: Page,
+    course_origin: Page,
     import_file: Option<PathBuf>,
     preview: Entries,
     pending_semester: Option<Semester>,
@@ -290,6 +317,9 @@ impl App {
     }
 
     fn close_main(&mut self) {
+        self.close_picker();
+        self.entry_times = None;
+        self.picker_focus = None;
         self.clear_form();
         unsafe {
             DestroyWindow(self.main);
@@ -297,6 +327,10 @@ impl App {
         self.main = null_mut();
         self.page = Page::Today;
         self.scroll = 0;
+        self.week_scroll = None;
+        self.detail_scroll = 0;
+        self.scrollbar = None;
+        self.scroll_drag = None;
         self.main_hits.clear();
         self.hover = None;
         self.preview.clear();
@@ -313,25 +347,42 @@ impl App {
 
     fn navigate(&mut self, page: Page) {
         if let Page::Edit(id) = page {
+            let entry = id.and_then(|id| self.state.entries.get(&id).cloned());
+            if id.is_some() && entry.is_none() {
+                self.status = "这条记录已删除".into();
+                return;
+            }
             if !matches!(self.page, Page::Edit(_)) {
                 self.return_page = self.page;
             }
-            self.editing_before = id.and_then(|id| self.state.entries.get(&id).cloned());
+            self.editing_before = entry;
             self.editing_kind = self
                 .editing_before
                 .as_ref()
                 .map_or(Kind::Task, |entry| entry.kind);
+        } else if matches!(page, Page::Course(_)) {
+            self.course_origin = match self.page {
+                Page::Course(_) => self.course_origin,
+                Page::Edit(_) if matches!(self.return_page, Page::Course(_)) => self.course_origin,
+                Page::Edit(_) => self.return_page,
+                origin => origin,
+            };
+            self.detail_scroll = 0;
         }
         self.set_page(page);
     }
 
     fn set_page(&mut self, page: Page) {
+        self.close_picker();
+        self.picker_focus = None;
         self.page = page;
         self.selects.clear();
         self.scroll = 0;
+        self.scrollbar = None;
         self.hover = None;
         self.main_hits.clear();
         self.status.clear();
+        self.reset_entry_times();
         self.rebuild_form();
         self.repaint();
     }
@@ -456,19 +507,6 @@ impl App {
             Page::Edit(_) => {
                 let entry = self.editing_before.as_ref();
                 let is_course = self.editing_kind == Kind::Course;
-                let timestamp = |time: Option<DateTime<Utc>>| {
-                    time.map(|time| {
-                        time.with_timezone(&Local)
-                            .format("%Y-%m-%d %H:%M")
-                            .to_string()
-                    })
-                    .unwrap_or_default()
-                };
-                let date = if entry.is_none() && is_course {
-                    format!("{} ", self.day.format("%Y-%m-%d"))
-                } else {
-                    timestamp(entry.and_then(|e| e.start))
-                };
                 let lead = if entry.is_none() {
                     if is_course {
                         "10".into()
@@ -509,26 +547,15 @@ impl App {
                     ));
                 }
                 specs.push(Input::edit(
-                    if is_course {
-                        "上课时间"
-                    } else {
-                        "截止时间"
-                    },
-                    Bounds(228, 272, 174, 38),
-                    &date,
-                    "YYYY-MM-DD HH:MM",
+                    "提前分钟",
+                    Bounds(550, 334, 146, 38),
+                    &lead,
+                    "",
                 ));
-                specs.push(Input::edit(
-                    "结束时间",
-                    Bounds(410, 272, 170, 38),
-                    &timestamp(entry.and_then(|e| e.end)),
-                    "可选",
-                ));
-                specs.push(Input::edit("提前分钟", Bounds(592, 272, 104, 38), &lead, ""));
                 if !is_course {
                     specs.push(Input {
                         label: "重复",
-                        bounds: Bounds(228, 334, 348, 38),
+                        bounds: Bounds(228, 396, 348, 38),
                         value: String::new(),
                         hint: "",
                         options: RepeatRule::OPTIONS.to_vec(),
@@ -555,7 +582,10 @@ impl App {
                 let handle = create(
                     "EDIT",
                     &wide(&spec.value),
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32
+                    WS_CHILD
+                        | WS_VISIBLE
+                        | WS_TABSTOP
+                        | ES_AUTOHSCROLL as u32
                         | if spec.masked { ES_PASSWORD as u32 } else { 0 },
                     0,
                     bounds.left,
@@ -604,14 +634,155 @@ impl App {
                 slot: index,
             });
         }
-        if matches!(self.page, Page::Edit(_))
-            && let Some(handle) = self.input.first()
-        {
-            unsafe {
-                SetFocus(*handle);
-                SendMessageW(*handle, EM_SETSEL, 0, -1);
+        if matches!(self.page, Page::Edit(_)) {
+            if let Some(handle) = self.input.first() {
+                unsafe {
+                    SetFocus(*handle);
+                    SendMessageW(*handle, EM_SETSEL, 0, -1);
+                }
             }
         }
+    }
+
+    fn reset_entry_times(&mut self) {
+        if !matches!(self.page, Page::Edit(_)) {
+            self.entry_times = None;
+            return;
+        }
+        let is_course = self.editing_kind == Kind::Course;
+        let entry = self.editing_before.as_ref();
+        let start = entry.and_then(|entry| entry.start);
+        let end = entry.and_then(|entry| entry.end);
+        let start_value = start
+            .map(|time| time.with_timezone(&Local).naive_local())
+            .unwrap_or_else(|| {
+                if is_course {
+                    self.day.and_hms_opt(8, 0, 0).unwrap()
+                } else {
+                    let now = Local::now();
+                    now.date_naive()
+                        .and_hms_opt(now.hour(), now.minute(), 0)
+                        .unwrap()
+                }
+            });
+        let end_value = end
+            .map(|time| time.with_timezone(&Local).naive_local())
+            .unwrap_or(start_value + Duration::hours(1));
+        self.entry_times = Some([
+            EntryTime {
+                value: start_value,
+                enabled: is_course || start.is_some(),
+            },
+            EntryTime {
+                value: end_value,
+                enabled: end.is_some(),
+            },
+        ]);
+    }
+
+    fn open_picker(&mut self, index: usize, kind: PickerKind) -> Result<()> {
+        let Some(times) = self.entry_times else {
+            return Ok(());
+        };
+        let Some(value) = times.get(index).copied() else {
+            return Ok(());
+        };
+        if index == 1 && !times[0].enabled {
+            return Ok(());
+        }
+        if kind == PickerKind::Time && !value.enabled {
+            return Ok(());
+        }
+        self.close_picker();
+        let dpi = dpi(self.main);
+        let field = kind.field(index).rect(dpi);
+        let (width, height) = kind.popup_size();
+        let (w, h) = (ui::scale(width, dpi), ui::scale(height, dpi));
+        let gap = ui::scale(6, dpi);
+        let mut point = POINT {
+            x: field.left,
+            y: field.top,
+        };
+        let mut monitor = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let area = unsafe {
+            ClientToScreen(self.main, &mut point);
+            let screen = MonitorFromWindow(self.main, MONITOR_DEFAULTTONEAREST);
+            if GetMonitorInfoW(screen, &mut monitor) != 0 {
+                monitor.rcWork
+            } else {
+                win::work_area().0
+            }
+        };
+        let x = point.x.clamp(area.left, (area.right - w).max(area.left));
+        let below = point.y + field.bottom - field.top + gap;
+        let y = if below + h <= area.bottom {
+            below
+        } else {
+            point.y - gap - h
+        };
+        let y = y.clamp(area.top, (area.bottom - h).max(area.top));
+        self.picker_window = create(
+            PICKER,
+            &wide(if kind == PickerKind::Date {
+                "选择日期"
+            } else {
+                "选择时刻"
+            }),
+            WS_POPUP,
+            WS_EX_TOOLWINDOW,
+            x,
+            y,
+            w,
+            h,
+            self.main,
+        );
+        if self.picker_window.is_null() {
+            return Err("无法打开日期和时间选择器".into());
+        }
+        self.picker = Some(Picker {
+            index,
+            kind,
+            value: value.value,
+        });
+        self.picker_focus = Some(Action::OpenPicker(index, kind));
+        win::round_region(self.picker_window, ui::scale(14, dpi));
+        unsafe {
+            ShowWindow(self.picker_window, SW_SHOW);
+            SetFocus(self.picker_window);
+        }
+        Ok(())
+    }
+
+    fn close_picker(&mut self) {
+        let window = std::mem::replace(&mut self.picker_window, null_mut());
+        self.picker = None;
+        self.picker_hits.clear();
+        self.picker_hover = None;
+        if !window.is_null() {
+            unsafe {
+                let had_focus = GetFocus() == window;
+                DestroyWindow(window);
+                if had_focus {
+                    SetFocus(self.main);
+                }
+            }
+        }
+    }
+
+    fn confirm_picker(&mut self) {
+        if let (Some(picker), Some(times)) = (self.picker, &mut self.entry_times) {
+            times[picker.index] = EntryTime {
+                value: picker.value,
+                enabled: true,
+            };
+            if picker.index == 0 && !times[1].enabled {
+                times[1].value = picker.value + Duration::hours(1);
+            }
+        }
+        self.close_picker();
     }
 
     fn form_values(&self) -> Vec<String> {
@@ -628,6 +799,9 @@ impl App {
     fn paint(&mut self) {
         let now = Local::now();
         let conflict_ids = model::overlapping(&self.state.entries, self.day);
+        let week_start =
+            self.day - Duration::days(self.day.weekday().num_days_from_monday().into());
+        let week_end = week_start + Duration::days(6);
         let all = if self.page == Page::Preview {
             &self.preview
         } else {
@@ -639,16 +813,19 @@ impl App {
                 let date = entry
                     .start
                     .map(|start| start.with_timezone(&Local).date_naive());
-                let week_start = self.day
-                    - chrono::Duration::days(self.day.weekday().num_days_from_monday().into());
-                let week_end = week_start + chrono::Duration::days(6);
                 let show = match self.page {
                     Page::Today => {
                         date == Some(now.date_naive()) || entry.kind == Kind::Task && date.is_none()
                     }
                     Page::Week => {
                         entry.kind == Kind::Course
-                            && date.is_some_and(|date| (week_start..=week_end).contains(&date))
+                            && date.is_some_and(|date| {
+                                date <= week_end
+                                    && (date >= week_start
+                                        || entry.course_end().is_some_and(|end| {
+                                            end.with_timezone(&Local).date_naive() >= week_start
+                                        }))
+                            })
                     }
                     Page::Tasks => entry.kind == Kind::Task,
                     Page::Conflicts => entry.conflict || conflict_ids.contains(&id),
@@ -689,27 +866,69 @@ impl App {
                 format!("{}  ·  第 {week} 周", self.state.semester.name)
             })
             .unwrap_or_else(|| self.state.semester.name.clone());
-        self.main_hits = ui::draw_main(
+        let editing_course = self.editing_kind == Kind::Course;
+        let active_page = match self.page {
+            Page::Preview => Page::Import,
+            Page::Course(_) => self.course_origin,
+            Page::Edit(_) if !editing_course => Page::Tasks,
+            Page::Edit(_) if matches!(self.return_page, Page::Course(_)) => self.course_origin,
+            Page::Edit(_) => Page::Week,
+            page => page,
+        };
+        let course = if let Page::Course(id) = self.page {
+            self.state.entries.get(&id)
+        } else {
+            None
+        };
+        let course_colors = if self.page == Page::Week {
+            ui::course_colors(
+                self.state
+                    .entries
+                    .values()
+                    .filter(|entry| entry.kind == Kind::Course)
+                    .map(|entry| entry.title.as_str()),
+            )
+        } else {
+            Default::default()
+        };
+        let (hits, scrollbar) = ui::draw_main(
             self.main,
             dpi(self.main),
             Palette::new(self.dark),
             View {
                 page: self.page,
+                active_page,
                 day: self.day,
                 rows: &rows,
+                course_colors: &course_colors,
                 next,
                 scroll: self.scroll,
+                week_scroll: self.week_scroll,
+                detail_scroll: self.detail_scroll,
+                course,
                 status: &self.status,
                 sync_status,
                 connected: self.state.dav.is_some(),
                 startup: self.startup,
-                editing_course: self.editing_kind == Kind::Course,
+                editing_course,
+                entry_times: self.entry_times,
+                picker_focus: self
+                    .picker_focus
+                    .filter(|_| unsafe { GetFocus() } == self.main),
                 fields: &self.fields,
                 hover: self.hover,
-                conflict_ids: &conflict_ids,
                 semester: &semester_label,
             },
         );
+        self.main_hits = hits;
+        self.scrollbar = scrollbar;
+        if let Some(bar) = &self.scrollbar {
+            if self.page == Page::Week {
+                self.week_scroll = Some(bar.offset);
+            } else {
+                self.detail_scroll = bar.offset;
+            }
+        }
     }
 
     fn selected_file(&mut self, path: PathBuf) {
@@ -834,47 +1053,44 @@ impl App {
         };
         let values = self.form_values();
         let is_course = self.editing_kind == Kind::Course;
-        let (title, teacher, place, start, end, lead, repeat) = if is_course {
-            let [title, teacher, place, start, end, lead] = values.as_slice() else {
+        let (title, teacher, place, lead, repeat) = if is_course {
+            let [title, teacher, place, lead] = values.as_slice() else {
                 return Err("无法读取课程表单内容".into());
             };
-            (
-                title,
-                teacher.as_str(),
-                place,
-                start,
-                end,
-                lead,
-                None::<RepeatRule>,
-            )
+            (title, teacher.as_str(), place, lead, None::<RepeatRule>)
         } else {
-            let [title, place, start, end, lead] = values.as_slice() else {
+            let [title, place, lead] = values.as_slice() else {
                 return Err("无法读取待办表单内容".into());
             };
-            let repeat = self
-                .selects
-                .first()
-                .and_then(|index| RepeatRule::OPTIONS.get(*index))
-                .and_then(|label| RepeatRule::from_label(label));
-            (
-                title,
-                "",
-                place,
-                start,
-                end,
-                lead,
-                repeat,
-            )
+            let repeat = self.selects.first().map_or_else(
+                || self.editing_before.as_ref().and_then(|entry| entry.repeat),
+                |&index| {
+                    RepeatRule::OPTIONS
+                        .get(index)
+                        .and_then(|label| RepeatRule::from_label(label))
+                },
+            );
+            (title, "", place, lead, repeat)
         };
-        let time = |text: &str| {
-            if text.trim().is_empty() {
-                Ok(None)
-            } else {
-                model::local_time(text).map(Some)
-            }
+        let [start, end] = self.entry_times.ok_or("无法读取日期和时间")?;
+        let read = |field: EntryTime, saved: Option<DateTime<Utc>>| {
+            field
+                .enabled
+                .then(|| {
+                    saved
+                        .filter(|time| time.with_timezone(&Local).naive_local() == field.value)
+                        .map_or_else(|| model::local_datetime(field.value), Ok)
+                })
+                .transpose()
         };
-        let start = time(start)?;
-        let end = time(end)?;
+        let start = read(
+            start,
+            self.editing_before.as_ref().and_then(|entry| entry.start),
+        )?;
+        let end = read(
+            end,
+            self.editing_before.as_ref().and_then(|entry| entry.end),
+        )?;
         let lead = if lead.trim().is_empty() {
             None
         } else {
@@ -1153,7 +1369,7 @@ impl App {
         let date = now.with_timezone(&Local).date_naive();
         if date != self.app_date {
             if self.day == self.app_date {
-                self.day = date;
+                self.select_day(date);
             }
             self.app_date = date;
         }
@@ -1282,6 +1498,63 @@ impl App {
     fn act(&mut self, action: Action) -> Result<()> {
         match action {
             Action::Page(page) => self.navigate(page),
+            Action::OpenPicker(index, kind) => self.open_picker(index, kind)?,
+            Action::ClosePicker => self.close_picker(),
+            Action::ConfirmPicker => self.confirm_picker(),
+            Action::ClearDate(index) => {
+                if let Some(times) = &mut self.entry_times {
+                    if index == 1 {
+                        times[1].enabled = false;
+                    } else if self.editing_kind == Kind::Task {
+                        times[0].enabled = false;
+                        times[1].enabled = false;
+                    }
+                }
+            }
+            Action::PickerDate(date) => {
+                if let Some(picker) = &mut self.picker {
+                    picker.value = date.and_time(picker.value.time());
+                    self.confirm_picker();
+                }
+            }
+            Action::PickerMonth(_)
+            | Action::PickerStep(_)
+            | Action::PickerHour(_)
+            | Action::PickerMinute(_) => {
+                if let Some(picker) = &mut self.picker {
+                    let value = picker.value;
+                    picker.value = match action {
+                        Action::PickerMonth(delta) if delta < 0 => {
+                            value.checked_sub_months(Months::new(delta.unsigned_abs()))
+                        }
+                        Action::PickerMonth(delta) => {
+                            value.checked_add_months(Months::new(delta as u32))
+                        }
+                        Action::PickerStep(delta) if picker.kind == PickerKind::Date => {
+                            value.checked_add_signed(Duration::days(delta.into()))
+                        }
+                        Action::PickerStep(delta) => {
+                            let (time, _) = value
+                                .time()
+                                .overflowing_add_signed(Duration::minutes(delta.into()));
+                            Some(value.date().and_time(time))
+                        }
+                        Action::PickerHour(hour) => value.with_hour(hour),
+                        Action::PickerMinute(minute) => value.with_minute(minute),
+                        _ => None,
+                    }
+                    .unwrap_or(value);
+                }
+            }
+            Action::Back => {
+                let page = match self.page {
+                    Page::Course(_) => self.course_origin,
+                    Page::Edit(_) => self.return_page,
+                    Page::Preview => Page::Import,
+                    _ => return Ok(()),
+                };
+                self.set_page(page);
+            }
             Action::NewCourse => {
                 self.return_page = self.page;
                 self.editing_kind = Kind::Course;
@@ -1289,7 +1562,7 @@ impl App {
                 self.set_page(Page::Edit(None));
             }
             Action::Day(date) => {
-                self.day = date;
+                self.select_day(date);
                 self.set_page(Page::Week);
             }
             Action::Choose(slot, option) => {
@@ -1347,6 +1620,7 @@ impl App {
                 }
                 self.preview.clear();
                 self.day = self.app_date;
+                self.week_scroll = None;
                 self.set_page(Page::Week);
                 self.status = format!("已新增或更新 {count} 次课程");
             }
@@ -1362,7 +1636,12 @@ impl App {
                 let mut entries = self.state.entries.clone();
                 entries.remove(&id);
                 self.commit(entries)?;
-                self.set_page(self.return_page);
+                let return_page = if self.return_page == Page::Course(id) {
+                    self.course_origin
+                } else {
+                    self.return_page
+                };
+                self.set_page(return_page);
                 self.status = "已删除".into();
             }
             Action::SaveDav => self.save_dav()?,
@@ -1428,7 +1707,17 @@ impl App {
                     match action {
                         Action::OpenReminder => {
                             self.open();
-                            self.navigate(Page::Edit(Some(id)));
+                            let page = if self
+                                .state
+                                .entries
+                                .get(&id)
+                                .is_some_and(|entry| entry.kind == Kind::Course)
+                            {
+                                Page::Course(id)
+                            } else {
+                                Page::Edit(Some(id))
+                            };
+                            self.navigate(page);
                         }
                         Action::Snooze => {
                             let now = Utc::now();
@@ -1452,8 +1741,30 @@ impl App {
             Action::PickFile => {}
         }
         self.repaint();
+        if !self.picker_window.is_null() {
+            unsafe { InvalidateRect(self.picker_window, null(), 0) };
+        }
         self.arm_timer();
         Ok(())
+    }
+
+    fn select_day(&mut self, day: NaiveDate) {
+        let monday = self.day - Duration::days(self.day.weekday().num_days_from_monday().into());
+        if !(monday..monday + Duration::days(7)).contains(&day) {
+            self.week_scroll = None;
+        }
+        self.day = day;
+    }
+
+    fn scroll_to(&mut self, offset: i32) {
+        let Some(bar) = &self.scrollbar else { return };
+        let offset = offset.clamp(0, bar.limit);
+        match self.page {
+            Page::Week => self.week_scroll = Some(offset),
+            Page::Course(_) => self.detail_scroll = offset,
+            _ => return,
+        }
+        self.repaint();
     }
 }
 
@@ -1512,26 +1823,72 @@ fn handle_key(msg: &MSG) -> bool {
     if msg.message != WM_KEYDOWN {
         return false;
     }
-    let Some((main, page, fields)) = with_app(|app| (app.main, app.page, app.input.clone())) else {
+    let Some((main, page, fields, focus, times)) = with_app(|app| {
+        (
+            app.main,
+            app.page,
+            app.input.clone(),
+            app.picker_focus,
+            app.entry_times,
+        )
+    }) else {
         return false;
     };
     if main.is_null() || (msg.hwnd != main && unsafe { IsChild(main, msg.hwnd) } == 0) {
         return false;
     }
-    match msg.wParam as u16 {
+    let key = msg.wParam as u16;
+    match key {
         VK_TAB if !fields.is_empty() => {
+            let mut stops: Vec<_> = fields.into_iter().map(|window| (window, None)).collect();
+            if let Some(times) = times {
+                let lead = stops.len() - 1;
+                let pickers = times
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index == 0 || times[0].enabled)
+                    .flat_map(|(index, value)| {
+                        [
+                            Some(Action::OpenPicker(index, PickerKind::Date)),
+                            value
+                                .enabled
+                                .then_some(Action::OpenPicker(index, PickerKind::Time)),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .map(|action| (main, Some(action)))
+                    });
+                stops.splice(lead..lead, pickers);
+            }
             let backwards = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
-            let index = fields.iter().position(|handle| *handle == msg.hwnd);
+            let index = stops.iter().position(|&(window, action)| {
+                msg.hwnd == window && (window != main || action == focus)
+            });
             let next = match index {
-                Some(index) if backwards => (index + fields.len() - 1) % fields.len(),
-                Some(index) => (index + 1) % fields.len(),
-                None if backwards => fields.len() - 1,
+                Some(index) if backwards => (index + stops.len() - 1) % stops.len(),
+                Some(index) => (index + 1) % stops.len(),
+                None if backwards => stops.len() - 1,
                 None => 0,
             };
-            unsafe {
-                SetFocus(fields[next]);
-            }
+            let (window, action) = stops[next];
+            with_app(|app| {
+                app.picker_focus = action;
+                app.repaint();
+            });
+            unsafe { SetFocus(window) };
             true
+        }
+        VK_RETURN | VK_SPACE if msg.hwnd == main && focus.is_some() => {
+            perform(main, focus.unwrap());
+            true
+        }
+        VK_DELETE if msg.hwnd == main => {
+            if let Some(Action::OpenPicker(index, PickerKind::Date)) = focus {
+                perform(main, Action::ClearDate(index));
+                true
+            } else {
+                false
+            }
         }
         VK_RETURN => {
             let action = match page {
@@ -1543,14 +1900,8 @@ fn handle_key(msg: &MSG) -> bool {
             perform(main, action);
             true
         }
-        VK_ESCAPE if matches!(page, Page::Edit(_) | Page::Preview) => {
-            with_app(|app| {
-                app.set_page(if page == Page::Preview {
-                    Page::Import
-                } else {
-                    app.return_page
-                })
-            });
+        VK_ESCAPE if matches!(page, Page::Course(_) | Page::Edit(_) | Page::Preview) => {
+            perform(main, Action::Back);
             true
         }
         VK_F5 => {
@@ -1558,11 +1909,13 @@ fn handle_key(msg: &MSG) -> bool {
             true
         }
         VK_UP | VK_PRIOR | VK_DOWN | VK_NEXT if msg.hwnd == main => {
-            scroll(if matches!(msg.wParam as u16, VK_UP | VK_PRIOR) {
+            let key = msg.wParam as u16;
+            let direction = if matches!(key, VK_UP | VK_PRIOR) {
                 -1
             } else {
                 1
-            });
+            };
+            scroll(direction, matches!(key, VK_PRIOR | VK_NEXT));
             true
         }
         _ => false,
@@ -1783,9 +2136,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 }
             }
         }
-        WM_SIZE => unsafe {
-            InvalidateRect(hwnd, null(), 0);
-        },
+        WM_MOVE | WM_SIZE => {
+            with_app(App::close_picker);
+            unsafe { InvalidateRect(hwnd, null(), 0) };
+        }
         WM_ERASEBKGND => return 1,
         WM_GETMINMAXINFO => unsafe {
             let info = &mut *(l as *mut MINMAXINFO);
@@ -1822,7 +2176,17 @@ unsafe extern "system" fn main_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
         WM_CLOSE => {
             with_app(App::close_main);
         }
-        WM_LBUTTONUP => handle_click(hwnd, l, false),
+        WM_LBUTTONDOWN if begin_scroll(hwnd, l) => {}
+        WM_LBUTTONUP => {
+            if with_app(|app| app.scroll_drag.take().is_some()).unwrap_or(false) {
+                unsafe { ReleaseCapture() };
+            } else {
+                handle_click(hwnd, l);
+            }
+        }
+        WM_CAPTURECHANGED => {
+            with_app(|app| app.scroll_drag = None);
+        }
         WM_DROPFILES => {
             let drop = w as HDROP;
             let size = unsafe { DragQueryFileW(drop, 0, null_mut(), 0) };
@@ -1838,8 +2202,9 @@ unsafe extern "system" fn main_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 with_app(|app| app.selected_file(PathBuf::from(path)));
             }
         }
-        WM_MOUSEMOVE | WM_MOUSELEAVE => handle_hover(hwnd, message, l, false),
-        WM_MOUSEWHEEL => scroll(-(((w >> 16) as i16) as i32).signum()),
+        WM_MOUSEMOVE if drag_scroll(l) => {}
+        WM_MOUSEMOVE | WM_MOUSELEAVE => handle_hover(hwnd, message, l),
+        WM_MOUSEWHEEL => scroll(-(((w >> 16) as i16) as i32).signum(), false),
         WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX => {
             if let Some(brush) = with_app(|app| {
                 let p = Palette::new(app.dark);
@@ -1889,8 +2254,72 @@ unsafe extern "system" fn toast_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPA
                 }
             }
         }
-        WM_LBUTTONUP => handle_click(hwnd, l, true),
-        WM_MOUSEMOVE | WM_MOUSELEAVE => handle_hover(hwnd, message, l, true),
+        WM_LBUTTONUP => handle_click(hwnd, l),
+        WM_MOUSEMOVE | WM_MOUSELEAVE => handle_hover(hwnd, message, l),
+        _ => return unsafe { DefWindowProcW(hwnd, message, w, l) },
+    }
+    0
+}
+
+unsafe extern "system" fn picker_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    match message {
+        WM_ERASEBKGND => return 1,
+        WM_PAINT => {
+            let painted = with_app(|app| {
+                if app.picker_window == hwnd
+                    && let Some(picker) = app.picker
+                {
+                    app.picker_hits = ui::draw_picker(
+                        hwnd,
+                        dpi(hwnd),
+                        Palette::new(app.dark),
+                        picker,
+                        app.picker_hover,
+                    );
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+            if !painted {
+                unsafe { ValidateRect(hwnd, null()) };
+            }
+        }
+        WM_ACTIVATE if w as u16 == WA_INACTIVE as u16 => unsafe {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        },
+        WM_CLOSE => {
+            with_app(|app| {
+                if app.picker_window == hwnd {
+                    app.close_picker();
+                    app.repaint();
+                }
+            });
+        }
+        WM_LBUTTONUP => handle_click(hwnd, l),
+        WM_MOUSEMOVE | WM_MOUSELEAVE => handle_hover(hwnd, message, l),
+        WM_KEYDOWN => {
+            let Some(kind) = with_app(|app| app.picker.map(|picker| picker.kind)).flatten() else {
+                return 0;
+            };
+            let action = match w as u16 {
+                VK_ESCAPE => Action::ClosePicker,
+                VK_RETURN | VK_SPACE => Action::ConfirmPicker,
+                VK_LEFT => Action::PickerStep(-1),
+                VK_RIGHT => Action::PickerStep(1),
+                VK_UP if kind == PickerKind::Date => Action::PickerStep(-7),
+                VK_DOWN if kind == PickerKind::Date => Action::PickerStep(7),
+                VK_UP => Action::PickerStep(1),
+                VK_DOWN => Action::PickerStep(-1),
+                VK_PRIOR if kind == PickerKind::Date => Action::PickerMonth(-1),
+                VK_NEXT if kind == PickerKind::Date => Action::PickerMonth(1),
+                VK_PRIOR => Action::PickerStep(60),
+                VK_NEXT => Action::PickerStep(-60),
+                _ => return unsafe { DefWindowProcW(hwnd, message, w, l) },
+            };
+            perform(hwnd, action);
+        }
         _ => return unsafe { DefWindowProcW(hwnd, message, w, l) },
     }
     0
@@ -1905,16 +2334,23 @@ fn hit(hits: &[Hit], pos: LPARAM) -> Option<Action> {
         .map(|item| item.1)
 }
 
-fn handle_click(window: HWND, pos: LPARAM, toast: bool) {
+fn handle_click(window: HWND, pos: LPARAM) {
     let action = with_app(|app| {
-        hit(
-            if toast {
-                &app.toast_hits
-            } else {
-                &app.main_hits
-            },
-            pos,
-        )
+        if app.toast == window {
+            hit(&app.toast_hits, pos).or(Some(Action::Dismiss))
+        } else if app.picker_window == window {
+            hit(&app.picker_hits, pos)
+        } else if app.main == window {
+            let action = hit(&app.main_hits, pos);
+            if !matches!(action, Some(Action::OpenPicker(..) | Action::ClearDate(_)))
+                && app.picker_focus.take().is_some()
+            {
+                app.repaint();
+            }
+            action
+        } else {
+            None
+        }
     })
     .flatten();
     if let Some(action) = action {
@@ -1922,10 +2358,13 @@ fn handle_click(window: HWND, pos: LPARAM, toast: bool) {
     }
 }
 
-fn handle_hover(window: HWND, message: u32, pos: LPARAM, toast: bool) {
+fn handle_hover(window: HWND, message: u32, pos: LPARAM) {
     with_app(|app| {
+        let toast = app.toast == window;
         let (hits, hovered) = if toast {
             (&app.toast_hits, &mut app.toast_hover)
+        } else if app.picker_window == window {
+            (&app.picker_hits, &mut app.picker_hover)
         } else {
             (&app.main_hits, &mut app.hover)
         };
@@ -1940,7 +2379,7 @@ fn handle_hover(window: HWND, message: u32, pos: LPARAM, toast: bool) {
                 InvalidateRect(window, null(), 0);
             }
         }
-        if message == WM_MOUSEMOVE && action.is_some() {
+        if message == WM_MOUSEMOVE && (action.is_some() || toast) {
             let mut tracking = TRACKMOUSEEVENT {
                 cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
                 dwFlags: TME_LEAVE,
@@ -1955,12 +2394,65 @@ fn handle_hover(window: HWND, message: u32, pos: LPARAM, toast: bool) {
     });
 }
 
-fn scroll(delta: i32) {
+fn begin_scroll(window: HWND, pos: LPARAM) -> bool {
+    let point = POINT {
+        x: pos as i16 as i32,
+        y: (pos >> 16) as i16 as i32,
+    };
+    let Some(handled) = with_app(|app| {
+        let Some(bar) = &app.scrollbar else {
+            return false;
+        };
+        if unsafe { PtInRect(&bar.track, point) } == 0 {
+            return false;
+        }
+        if unsafe { PtInRect(&bar.thumb, point) } != 0 {
+            app.scroll_drag = Some(point.y - bar.thumb.top);
+        } else {
+            let direction = if point.y < bar.thumb.top { -1 } else { 1 };
+            app.scroll_to(bar.offset + direction * bar.page_height);
+        }
+        true
+    }) else {
+        return false;
+    };
+    if with_app(|app| app.scroll_drag.is_some()).unwrap_or(false) {
+        unsafe { SetCapture(window) };
+    }
+    handled
+}
+
+fn drag_scroll(pos: LPARAM) -> bool {
     with_app(|app| {
-        if matches!(
-            app.page,
-            Page::Today | Page::Week | Page::Tasks | Page::Preview
-        ) {
+        let (Some(grab), Some(bar)) = (app.scroll_drag, &app.scrollbar) else {
+            return false;
+        };
+        let travel = bar.track.bottom - bar.track.top - (bar.thumb.bottom - bar.thumb.top);
+        if travel > 0 {
+            let y = (pos >> 16) as i16 as i32;
+            let moved = (y - grab - bar.track.top).clamp(0, travel);
+            app.scroll_to((moved * bar.limit + travel / 2) / travel);
+        }
+        true
+    })
+    .unwrap_or(false)
+}
+
+fn scroll(delta: i32, by_page: bool) {
+    with_app(|app| {
+        if let Some(bar) = &app.scrollbar {
+            let position = if app.page == Page::Week {
+                app.week_scroll.unwrap_or(bar.offset)
+            } else {
+                app.detail_scroll
+            };
+            let step = if by_page {
+                (bar.page_height - 24).max(1)
+            } else {
+                60
+            };
+            app.scroll_to(position + delta * step);
+        } else if matches!(app.page, Page::Today | Page::Tasks | Page::Preview) {
             app.scroll = app.scroll.saturating_add_signed(delta as isize);
             app.repaint();
         }
