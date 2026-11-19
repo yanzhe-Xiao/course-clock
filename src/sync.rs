@@ -17,7 +17,7 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    model::{DavSettings, Entries, Result, Semester, merge},
+    model::{DavSettings, Entries, Result, Semester, merge, merge_semester},
     win::wide,
 };
 
@@ -110,7 +110,7 @@ struct Document {
 pub struct Synced {
     pub entries: Entries,
     pub conflicts: usize,
-    pub semester: Option<Semester>,
+    pub semester: Semester,
 }
 
 pub fn sync(
@@ -119,6 +119,7 @@ pub fn sync(
     base: &Entries,
     local: &Entries,
     semester: &Semester,
+    base_semester: Option<&Semester>,
 ) -> Result<Synced> {
     let url = endpoint(&settings.url)?;
     let client = Client::new(&url, settings)?;
@@ -149,17 +150,21 @@ pub fn sync(
             status => return Err(http_error("读取", status)),
         };
         let (merged, conflicts) = merge(base, local, &entries);
-        if merged == entries && remote.status == 200 {
+        let merged_semester = remote_semester.as_ref().map_or_else(
+            || semester.clone(),
+            |remote| merge_semester(base_semester, semester, remote),
+        );
+        if merged == entries && remote_semester.as_ref() == Some(&merged_semester) {
             return Ok(Synced {
                 entries: merged,
                 conflicts,
-                semester: remote_semester,
+                semester: merged_semester,
             });
         }
         let doc = Document {
             version: 1,
             entries: merged,
-            semester: Some(remote_semester.unwrap_or_else(|| semester.clone())),
+            semester: Some(merged_semester.clone()),
         };
         let bytes = serde_json::to_vec(&doc).map_err(|error| error.to_string())?;
         if bytes.len() > MAX_DOCUMENT {
@@ -171,7 +176,7 @@ pub fn sync(
                 return Ok(Synced {
                     entries: doc.entries,
                     conflicts,
-                    semester: doc.semester,
+                    semester: merged_semester,
                 });
             }
             412 => continue,

@@ -27,7 +27,7 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    model::{Entry, Kind},
+    model::{self, Entries, Entry, Kind},
     win::wide,
 };
 
@@ -232,7 +232,7 @@ const COURSE_COLORS: [u32; 36] = [
     0xc4f7ca, 0xb9f3e4, 0xdbc4f0, 0xf0a8d0, 0xffe6c9, 0xf4f8d3, 0xc9e9d2, 0xb4d3d9, 0xb5baff,
 ];
 
-pub fn course_colors<'a>(titles: impl Iterator<Item = &'a str>) -> BTreeMap<&'a str, u32> {
+fn course_colors<'a>(titles: impl Iterator<Item = &'a str>) -> BTreeMap<&'a str, u32> {
     let names: BTreeSet<_> = titles.map(str::trim).collect();
     let mut used = BTreeSet::new();
     // Walk the light RGB cube in a fixed order when the curated set is exhausted.
@@ -275,15 +275,17 @@ pub struct View<'a> {
     pub active_page: Page,
     pub day: NaiveDate,
     pub rows: &'a [(Uuid, &'a Entry)],
-    pub course_colors: &'a BTreeMap<&'a str, u32>,
+    pub entries: &'a Entries,
     pub next: Option<&'a Entry>,
     pub scroll: usize,
     pub week_scroll: Option<i32>,
     pub detail_scroll: i32,
+    pub conflict_scroll: i32,
     pub course: Option<&'a Entry>,
     pub status: &'a str,
     pub sync_status: &'a str,
     pub connected: bool,
+    pub syncing: bool,
     pub startup: bool,
     pub editing_course: bool,
     pub entry_times: Option<[EntryTime; 2]>,
@@ -316,6 +318,7 @@ pub fn draw_main(
     dpi: i32,
     palette: Palette,
     view: View<'_>,
+    week_cache: &mut WeekCache,
 ) -> (Vec<Hit>, Option<Scrollbar>) {
     let mut f = Frame::new(window, dpi, palette, view.hover);
     let p = f.p;
@@ -518,7 +521,8 @@ pub fn draw_main(
                 p.muted,
                 false,
             );
-            scrollbar = draw_week_grid(&mut f, x, 212, width, &view, monday, today);
+            let layout = week_cache.layout(&mut f, x, width, monday, view.entries);
+            scrollbar = draw_week_grid(&mut f, Bounds(x, 212, width, 0), &view, layout, today);
         }
         Page::Tasks => {
             let remaining = view.rows.iter().filter(|(_, entry)| !entry.done).count();
@@ -535,13 +539,13 @@ pub fn draw_main(
         Page::Conflicts => {
             f.text(
                 Bounds(x + 1, 112, width - 130, 26),
-                &format!("{} 条记录需要处理", view.rows.len()),
+                &format!("{} 条记录需要处理 · 课程重叠按所选周显示", view.rows.len()),
                 13,
                 500,
                 p.muted,
                 false,
             );
-            draw_conflicts(&mut f, x, 148, width, &view);
+            scrollbar = draw_conflicts(&mut f, x, 148, width, &view);
         }
         Page::Import => {
             f.text(
@@ -641,12 +645,13 @@ pub fn draw_main(
                 false,
             );
             f.button(Bounds(x, 552, 116, 38), "导出备份", Action::Backup, false);
-            f.button(
-                Bounds(x + 128, 552, 116, 38),
-                "恢复备份",
-                Action::Restore,
-                false,
-            );
+            let restore = Bounds(x + 128, 552, 116, 38);
+            if view.syncing {
+                f.round(restore, 8, p.field, p.line);
+                f.text(restore, "恢复备份", 13, 600, p.muted, true);
+            } else {
+                f.button(restore, "恢复备份", Action::Restore, false);
+            }
         }
         Page::Course(_) => {
             scrollbar = draw_course_detail(&mut f, x, width, view.course, view.detail_scroll);
@@ -1129,7 +1134,6 @@ fn draw_hero(f: &mut Frame, x: i32, width: i32, next: Option<&Entry>) {
 }
 
 const SECONDS_PER_HOUR: i32 = 3600;
-const DAY_SECONDS: i32 = 24 * SECONDS_PER_HOUR;
 const HOUR_HEIGHT: i32 = 80;
 const TIME_GUTTER: i32 = 44;
 const SCROLL_GUTTER: i32 = 16;
@@ -1143,54 +1147,7 @@ fn week_column(x: i32, width: i32, day: i32) -> (i32, i32) {
     )
 }
 
-struct WeekSlot<'a> {
-    id: Uuid,
-    entry: &'a Entry,
-    start: i32,
-    end: i32,
-    lane: i32,
-}
-
-fn week_slots<'a>(rows: &[(Uuid, &'a Entry)], monday: NaiveDate) -> [Vec<WeekSlot<'a>>; 7] {
-    let mut days: [Vec<_>; 7] = std::array::from_fn(|_| Vec::new());
-    for &(id, entry) in rows {
-        let (Some(start), Some(end)) = (entry.start, entry.course_end()) else {
-            continue;
-        };
-        let start = start.with_timezone(&Local);
-        let end = end.with_timezone(&Local);
-        let first = (start.date_naive() - monday).num_days();
-        let last = (end.date_naive() - monday).num_days();
-        for day in first.max(0)..=last.min(6) {
-            let start_second = if day == first {
-                start.num_seconds_from_midnight() as i32
-            } else {
-                0
-            };
-            let end_second = if day == last {
-                end.num_seconds_from_midnight() as i32
-            } else {
-                DAY_SECONDS
-            };
-            if day == last && day != first && end_second == 0 {
-                continue;
-            }
-            days[day as usize].push(WeekSlot {
-                id,
-                entry,
-                start: start_second,
-                end: end_second.max(start_second + 1),
-                lane: 0,
-            });
-        }
-    }
-    for slots in &mut days {
-        slots.sort_by_key(|slot| (slot.start, slot.end));
-    }
-    days
-}
-
-struct WeekCard<'a> {
+struct WeekCard {
     id: Uuid,
     x: i32,
     width: i32,
@@ -1199,16 +1156,16 @@ struct WeekCard<'a> {
     end: i32,
     color: u32,
     conflict: bool,
-    labels: [(&'a str, i32, i32, i32); 3],
+    labels: [(i32, i32, i32); 3],
 }
 
-impl WeekCard<'_> {
+impl WeekCard {
     fn min_height(&self) -> i32 {
         let text_height: i32 = self
             .labels
             .iter()
-            .filter(|label| label.3 != 0)
-            .map(|label| label.3 + 1)
+            .filter(|label| label.2 != 0)
+            .map(|label| label.2 + 1)
             .sum();
         if text_height == 0 {
             1
@@ -1218,25 +1175,36 @@ impl WeekCard<'_> {
     }
 }
 
-fn week_cards<'a>(
+fn week_labels(entry: &Entry) -> [&str; 3] {
+    [
+        entry.title.trim(),
+        entry.teacher.trim(),
+        classroom_label(&entry.place),
+    ]
+}
+
+fn week_cards(
     f: &mut Frame,
     x: i32,
     width: i32,
-    view: &View<'a>,
+    entries: &Entries,
+    colors: &BTreeMap<String, u32>,
     monday: NaiveDate,
-) -> Vec<WeekCard<'a>> {
+) -> Vec<WeekCard> {
     let mut cards = Vec::new();
-    for (day, mut slots) in week_slots(view.rows, monday).into_iter().enumerate() {
+    for (day, slots) in model::week_courses(entries, monday).into_iter().enumerate() {
         let (left, width) = week_column(x, width, day as i32);
         let mut group_start = 0;
         let mut group_end = 0;
-        let mut lane_ends = Vec::new();
+        let mut lane_ends: Vec<i32> = Vec::new();
+        let mut assigned_lanes: Vec<i32> = Vec::with_capacity(slots.len());
         for index in 0..=slots.len() {
             if index == slots.len() || slots[index].start >= group_end {
                 let lanes = lane_ends.len() as i32;
-                for slot in &slots[group_start..index] {
-                    let lane_left = (width - 4) * slot.lane / lanes;
-                    let lane_right = (width - 4) * (slot.lane + 1) / lanes;
+                for (slot, &lane) in slots[group_start..index].iter().zip(&assigned_lanes) {
+                    let entry = &entries[&slot.id];
+                    let lane_left = (width - 4) * lane / lanes;
+                    let lane_right = (width - 4) * (lane + 1) / lanes;
                     let width = (lane_right - lane_left - 2).max(1);
                     let padding = if width >= 40 {
                         5
@@ -1244,12 +1212,12 @@ fn week_cards<'a>(
                         (width / 10).clamp(1, 3)
                     };
                     let text_width = width - 2 * padding;
-                    let title = slot.entry.title.trim();
+                    let [title, teacher, place] = week_labels(entry);
                     let (title_size, detail_size) = if width < 40 { (10, 9) } else { (11, 10) };
                     let labels = [
                         (title, title_size, 700),
-                        (slot.entry.teacher.trim(), detail_size, 500),
-                        (classroom_label(&slot.entry.place), detail_size, 500),
+                        (teacher, detail_size, 500),
+                        (place, detail_size, 500),
                     ]
                     .map(|(text, size, weight)| {
                         let height = if text.is_empty() || text_width < size {
@@ -1257,7 +1225,7 @@ fn week_cards<'a>(
                         } else {
                             f.wrapped_height(text_width, text, size, weight)
                         };
-                        (text, size, weight, height)
+                        (size, weight, height)
                     });
                     cards.push(WeekCard {
                         id: slot.id,
@@ -1266,24 +1234,21 @@ fn week_cards<'a>(
                         padding,
                         start: slot.start,
                         end: slot.end,
-                        color: view
-                            .course_colors
-                            .get(title)
-                            .copied()
-                            .unwrap_or(COURSE_COLORS[0]),
-                        conflict: lanes > 1 || slot.entry.conflict,
+                        color: colors.get(title).copied().unwrap_or(COURSE_COLORS[0]),
+                        conflict: slot.overlaps || entry.conflict,
                         labels,
                     });
                 }
                 group_start = index;
                 lane_ends.clear();
+                assigned_lanes.clear();
                 group_end = 0;
             }
-            let Some(slot) = slots.get_mut(index) else {
+            let Some(slot) = slots.get(index) else {
                 break;
             };
             let lane = lane_ends.iter().position(|&end| end <= slot.start);
-            slot.lane = lane.unwrap_or(lane_ends.len()) as i32;
+            assigned_lanes.push(lane.unwrap_or(lane_ends.len()) as i32);
             if let Some(lane) = lane {
                 lane_ends[lane] = slot.end;
             } else {
@@ -1335,44 +1300,111 @@ fn week_time_position(marks: &BTreeMap<i32, i32>, second: i32) -> i32 {
     top + (i64::from(bottom - top) * i64::from(second - before) / i64::from(after - before)) as i32
 }
 
+#[derive(Default)]
+pub struct WeekCache {
+    colors: Option<BTreeMap<String, u32>>,
+    layout: Option<WeekLayout>,
+}
+
+struct WeekLayout {
+    key: (NaiveDate, i32, i32, i32),
+    cards: Vec<(i32, i32, WeekCard)>,
+    start_hour: i32,
+    end_hour: i32,
+    first_hour: i32,
+    marks: BTreeMap<i32, i32>,
+}
+
+impl WeekCache {
+    fn layout(
+        &mut self,
+        f: &mut Frame,
+        x: i32,
+        width: i32,
+        monday: NaiveDate,
+        entries: &Entries,
+    ) -> &WeekLayout {
+        let key = (monday, x, width, f.dpi);
+        let colors = self.colors.get_or_insert_with(|| {
+            course_colors(
+                entries
+                    .values()
+                    .filter(|entry| entry.kind == Kind::Course)
+                    .map(|entry| entry.title.as_str()),
+            )
+            .into_iter()
+            .map(|(name, color)| (name.to_owned(), color))
+            .collect()
+        });
+        if self.layout.as_ref().is_some_and(|layout| layout.key != key) {
+            self.layout = None;
+        }
+        self.layout.get_or_insert_with(|| {
+            let cards = week_cards(f, x, width, entries, colors, monday);
+            let first_hour = cards
+                .iter()
+                .map(|card| card.start / SECONDS_PER_HOUR)
+                .min()
+                .unwrap_or(8);
+            let start_hour = first_hour.min(8);
+            let end_hour = cards
+                .iter()
+                .map(|card| (card.end + SECONDS_PER_HOUR - 1) / SECONDS_PER_HOUR)
+                .max()
+                .unwrap_or(22)
+                .max(22);
+            let marks = week_time_marks(
+                start_hour * SECONDS_PER_HOUR,
+                end_hour * SECONDS_PER_HOUR,
+                cards
+                    .iter()
+                    .map(|card| (card.start, card.end, card.min_height())),
+            );
+            let cards = cards
+                .into_iter()
+                .map(|card| {
+                    (
+                        week_time_position(&marks, card.start),
+                        week_time_position(&marks, card.end),
+                        card,
+                    )
+                })
+                .collect();
+            WeekLayout {
+                key,
+                cards,
+                start_hour,
+                end_hour,
+                first_hour,
+                marks,
+            }
+        })
+    }
+}
+
 fn draw_week_grid(
     f: &mut Frame,
-    x: i32,
-    y: i32,
-    width: i32,
-    view: &View,
-    monday: NaiveDate,
+    bounds: Bounds,
+    view: &View<'_>,
+    layout: &WeekLayout,
     today: NaiveDate,
 ) -> Option<Scrollbar> {
     let p = f.p;
-    let cards = week_cards(f, x, width, view, monday);
-    let first_hour = cards.iter().map(|card| card.start / SECONDS_PER_HOUR).min();
-    let last_hour = cards
-        .iter()
-        .map(|card| (card.end + SECONDS_PER_HOUR - 1) / SECONDS_PER_HOUR)
-        .max();
-    let start_hour = first_hour.unwrap_or(8).min(8);
-    let end_hour = last_hour.unwrap_or(22).max(22);
-    let marks = week_time_marks(
-        start_hour * SECONDS_PER_HOUR,
-        end_hour * SECONDS_PER_HOUR,
-        cards
-            .iter()
-            .map(|card| (card.start, card.end, card.min_height())),
-    );
-    let position = |second| week_time_position(&marks, second);
+    let Bounds(x, y, width, _) = bounds;
+    let monday = layout.key.0;
+    let start_hour = layout.start_hour;
+    let end_hour = layout.end_hour;
+    let position = |second| week_time_position(&layout.marks, second);
+    let content_height = position(end_hour * SECONDS_PER_HOUR) + 24;
     let bottom_margin = if view.status.is_empty() { 22 } else { 42 };
     let height = (f.height - bottom_margin - y).max(1);
     let content = Bounds(x, y, width - SCROLL_GUTTER, height);
     let requested_offset = view
         .week_scroll
-        .unwrap_or_else(|| position(first_hour.unwrap_or(8) * SECONDS_PER_HOUR));
-    let (offset, scrollbar) = f.scrollbar(
-        content,
-        position(end_hour * SECONDS_PER_HOUR) + 24,
-        requested_offset,
-    );
-    let time_y = |second| y + 12 + position(second) - offset;
+        .unwrap_or_else(|| position(layout.first_hour * SECONDS_PER_HOUR));
+    let (offset, scrollbar) = f.scrollbar(content, content_height, requested_offset);
+    let content_top = y + 12 - offset;
+    let time_y = |second| content_top + position(second);
     let today_offset = (today - monday).num_days();
     let left = x + TIME_GUTTER;
     let grid_width = content.2 - TIME_GUTTER;
@@ -1414,11 +1446,11 @@ fn draw_week_grid(
             f.round(Bounds(line_x - 3, line_y - 2, 6, 6), 6, p.danger, p.danger);
         }
 
-        for card in &cards {
-            let top = time_y(card.start);
-            let bottom = time_y(card.end);
+        for (card_top, card_bottom, card) in &layout.cards {
+            let top = content_top + card_top;
+            let bottom = content_top + card_bottom;
             if bottom > y && top < y + height {
-                draw_week_course(f, card, top, bottom);
+                draw_week_course(f, card, &view.entries[&card.id], top, bottom);
             }
         }
     });
@@ -1460,70 +1492,7 @@ fn classroom_label(place: &str) -> &str {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        COURSE_COLORS, classroom_label, course_colors, week_time_marks, week_time_position,
-    };
-    use std::collections::BTreeSet;
-
-    #[test]
-    fn weekly_classroom_preserves_room_names() {
-        for (place, expected) in [
-            ("长安校区 教东D1-403", "教东D1-403"),
-            ("友谊校区教西 D-301", "教西 D-301"),
-            ("长安校区 · 教学楼 A101", "教学楼 A101"),
-            ("（东区校区）计算中心 2 号机房", "计算中心 2 号机房"),
-            ("教 A101, 长安", "教 A101"),
-            ("教学楼 A101（友谊校区）", "教学楼 A101"),
-            ("教学楼 A101（分组） 友谊校区", "教学楼 A101（分组）"),
-            ("教室A101友谊校区", "教室A101"),
-            ("友谊校区", ""),
-            ("校区计算中心 A102", "校区计算中心 A102"),
-            ("创新楼（东） 1201", "创新楼（东） 1201"),
-        ] {
-            assert_eq!(classroom_label(place), expected, "{place}");
-        }
-    }
-
-    #[test]
-    fn weekly_colors_distinguish_course_names() {
-        let titles: Vec<_> = (0..48).map(|index| format!("课程 {index}")).collect();
-        let colors = course_colors(titles.iter().map(String::as_str));
-        assert_eq!(
-            colors,
-            course_colors(titles.iter().rev().map(String::as_str))
-        );
-        assert_eq!(
-            colors.values().copied().collect::<BTreeSet<_>>().len(),
-            titles.len()
-        );
-        assert!(
-            COURSE_COLORS
-                .into_iter()
-                .all(|color| colors.values().any(|&selected| color == selected))
-        );
-        let repeats = course_colors(["高等数学", " 高等数学 "].into_iter());
-        assert_eq!(repeats.len(), 1);
-    }
-
-    #[test]
-    fn weekly_timeline_makes_room_for_overlapping_course_labels() {
-        let marks = week_time_marks(
-            0,
-            7200,
-            [(900, 1800, 70), (1350, 2400, 120), (1800, 3600, 80)].into_iter(),
-        );
-        let y = |second| week_time_position(&marks, second);
-        assert!(y(1800) - y(900) >= 70);
-        assert!(y(2400) - y(1350) >= 120);
-        assert!(y(3600) - y(1800) >= 80);
-        assert!(y(1350) < y(1500) && y(1500) < y(1800));
-        assert_eq!(y(7200) - y(3600), 80);
-    }
-}
-
-fn draw_week_course(f: &mut Frame, card: &WeekCard<'_>, top: i32, bottom: i32) {
+fn draw_week_course(f: &mut Frame, card: &WeekCard, entry: &Entry, top: i32, bottom: i32) {
     let p = f.p;
     let action = Action::Page(Page::Course(card.id));
     let fill = p.course(card.color);
@@ -1539,7 +1508,7 @@ fn draw_week_course(f: &mut Frame, card: &WeekCard<'_>, top: i32, bottom: i32) {
     f.round(bounds, 8, fill, stroke);
     let mut y = bounds.1 + 4;
     let metadata = blend(p.text, fill, 28);
-    for (text, size, weight, height) in card.labels {
+    for (text, (size, weight, height)) in week_labels(entry).into_iter().zip(card.labels) {
         if height > 0 {
             f.wrap(
                 Bounds(
@@ -1646,7 +1615,7 @@ fn draw_course_detail(
     scrollbar
 }
 
-fn draw_conflicts(f: &mut Frame, x: i32, y: i32, w: i32, view: &View) {
+fn draw_conflicts(f: &mut Frame, x: i32, y: i32, w: i32, view: &View<'_>) -> Option<Scrollbar> {
     let p = f.p;
     if view.rows.is_empty() {
         f.round(Bounds(x, y, w, 66), 10, p.surface, p.line);
@@ -1658,43 +1627,54 @@ fn draw_conflicts(f: &mut Frame, x: i32, y: i32, w: i32, view: &View) {
             p.muted,
             false,
         );
-        return;
+        return None;
     }
-    for (index, &(id, entry)) in view.rows.iter().enumerate() {
-        let top = y + index as i32 * 70;
-        let row = Bounds(x, top, w, 62);
-        f.round(row, 10, p.surface, p.line);
-        f.round(Bounds(x, top + 12, 3, 38), 2, p.danger, p.danger);
-        f.text(
-            Bounds(x + 18, top + 8, w - 220, 24),
-            &entry.title,
-            14,
-            700,
-            p.text,
-            false,
-        );
-        let detail = format!("{}    ·    {}", entry.time_label(), entry.detail_label());
-        f.text(
-            Bounds(x + 18, top + 33, w - 220, 21),
-            &detail,
-            11,
-            400,
-            p.muted,
-            false,
-        );
-        f.button(
-            Bounds(x + w - 178, top + 15, 84, 32),
-            "编辑",
-            Action::Page(Page::Edit(Some(id))),
-            false,
-        );
-        f.button(
-            Bounds(x + w - 88, top + 15, 72, 32),
-            "已处理",
-            Action::ResolveConflict(id),
-            false,
-        );
-    }
+    let viewport = Bounds(x, y, w - SCROLL_GUTTER, (f.height - y - 42).max(1));
+    let content_height = view.rows.len() as i32 * 70;
+    let (offset, scrollbar) = f.scrollbar(viewport, content_height, view.conflict_scroll);
+    f.with_clip(viewport, |f| {
+        let start = (offset / 70) as usize;
+        let visible = (viewport.3 / 70 + 2).max(1) as usize;
+        for (index, &(id, entry)) in view.rows.iter().skip(start).take(visible).enumerate() {
+            let index = start + index;
+            let top = y + index as i32 * 70 - offset;
+            let row = Bounds(x, top, viewport.2, 62);
+            f.round(row, 10, p.surface, p.line);
+            f.round(Bounds(x, top + 12, 3, 38), 2, p.danger, p.danger);
+            f.text(
+                Bounds(x + 18, top + 8, viewport.2 - 220, 24),
+                &entry.title,
+                14,
+                700,
+                p.text,
+                false,
+            );
+            let detail = format!("{}    ·    {}", entry.time_label(), entry.detail_label());
+            f.text(
+                Bounds(x + 18, top + 33, viewport.2 - 220, 21),
+                &detail,
+                11,
+                400,
+                p.muted,
+                false,
+            );
+            f.button(
+                Bounds(x + viewport.2 - 178, top + 15, 84, 32),
+                "编辑",
+                Action::Page(Page::Edit(Some(id))),
+                false,
+            );
+            if entry.conflict {
+                f.button(
+                    Bounds(x + viewport.2 - 88, top + 15, 72, 32),
+                    "已处理",
+                    Action::ResolveConflict(id),
+                    false,
+                );
+            }
+        }
+    });
+    scrollbar
 }
 
 fn draw_rows(f: &mut Frame, x: i32, y: i32, w: i32, view: &View, empty: &str) {
@@ -2523,4 +2503,67 @@ impl Drop for Frame {
 
 pub fn color(value: u32) -> u32 {
     ((value & 0xff0000) >> 16) | (value & 0x00ff00) | ((value & 0xff) << 16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        COURSE_COLORS, classroom_label, course_colors, week_time_marks, week_time_position,
+    };
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn weekly_classroom_preserves_room_names() {
+        for (place, expected) in [
+            ("长安校区 教东D1-403", "教东D1-403"),
+            ("友谊校区教西 D-301", "教西 D-301"),
+            ("长安校区 · 教学楼 A101", "教学楼 A101"),
+            ("（东区校区）计算中心 2 号机房", "计算中心 2 号机房"),
+            ("教 A101, 长安", "教 A101"),
+            ("教学楼 A101（友谊校区）", "教学楼 A101"),
+            ("教学楼 A101（分组） 友谊校区", "教学楼 A101（分组）"),
+            ("教室A101友谊校区", "教室A101"),
+            ("友谊校区", ""),
+            ("校区计算中心 A102", "校区计算中心 A102"),
+            ("创新楼（东） 1201", "创新楼（东） 1201"),
+        ] {
+            assert_eq!(classroom_label(place), expected, "{place}");
+        }
+    }
+
+    #[test]
+    fn weekly_colors_distinguish_course_names() {
+        let titles: Vec<_> = (0..48).map(|index| format!("课程 {index}")).collect();
+        let colors = course_colors(titles.iter().map(String::as_str));
+        assert_eq!(
+            colors,
+            course_colors(titles.iter().rev().map(String::as_str))
+        );
+        assert_eq!(
+            colors.values().copied().collect::<BTreeSet<_>>().len(),
+            titles.len()
+        );
+        assert!(
+            COURSE_COLORS
+                .into_iter()
+                .all(|color| colors.values().any(|&selected| color == selected))
+        );
+        let repeats = course_colors(["高等数学", " 高等数学 "].into_iter());
+        assert_eq!(repeats.len(), 1);
+    }
+
+    #[test]
+    fn weekly_timeline_makes_room_for_overlapping_course_labels() {
+        let marks = week_time_marks(
+            0,
+            7200,
+            [(900, 1800, 70), (1350, 2400, 120), (1800, 3600, 80)].into_iter(),
+        );
+        let y = |second| week_time_position(&marks, second);
+        assert!(y(1800) - y(900) >= 70);
+        assert!(y(2400) - y(1350) >= 120);
+        assert!(y(3600) - y(1800) >= 80);
+        assert!(y(1350) < y(1500) && y(1500) < y(1800));
+        assert_eq!(y(7200) - y(3600), 80);
+    }
 }

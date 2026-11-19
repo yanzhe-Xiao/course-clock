@@ -33,7 +33,7 @@ use crate::{
     sync::{self, Synced},
     ui::{
         self, Action, Bounds, EntryTime, Field, Hit, Page, Palette, Picker, PickerKind, Scrollbar,
-        View,
+        View, WeekCache,
     },
     win::{self, wide},
 };
@@ -123,6 +123,8 @@ pub fn run() -> Result<()> {
         scroll: 0,
         week_scroll: None,
         detail_scroll: 0,
+        conflict_scroll: 0,
+        week_cache: WeekCache::default(),
         scrollbar: None,
         scroll_drag: None,
         main_hits: Vec::new(),
@@ -145,8 +147,7 @@ pub fn run() -> Result<()> {
         return_page: Page::Today,
         course_origin: Page::Today,
         import_file: None,
-        preview: Entries::new(),
-        pending_semester: None,
+        preview: None,
         status: String::new(),
         sync_status: String::new(),
         sync_due: None,
@@ -202,7 +203,13 @@ struct Popup {
 
 struct SyncJob {
     sent: Entries,
+    semester: Semester,
     result: Receiver<Result<Synced>>,
+}
+
+struct ImportPreview {
+    entries: Entries,
+    semester: Option<Semester>,
 }
 
 struct App {
@@ -223,6 +230,8 @@ struct App {
     scroll: usize,
     week_scroll: Option<i32>,
     detail_scroll: i32,
+    conflict_scroll: i32,
+    week_cache: WeekCache,
     scrollbar: Option<Scrollbar>,
     scroll_drag: Option<i32>,
     main_hits: Vec<Hit>,
@@ -245,8 +254,7 @@ struct App {
     return_page: Page,
     course_origin: Page,
     import_file: Option<PathBuf>,
-    preview: Entries,
-    pending_semester: Option<Semester>,
+    preview: Option<ImportPreview>,
     status: String,
     sync_status: String,
     sync_due: Option<DateTime<Utc>>,
@@ -329,11 +337,12 @@ impl App {
         self.scroll = 0;
         self.week_scroll = None;
         self.detail_scroll = 0;
+        self.conflict_scroll = 0;
         self.scrollbar = None;
         self.scroll_drag = None;
         self.main_hits.clear();
         self.hover = None;
-        self.preview.clear();
+        self.preview = None;
         self.arm_timer();
     }
 
@@ -375,6 +384,9 @@ impl App {
     fn set_page(&mut self, page: Page) {
         self.close_picker();
         self.picker_focus = None;
+        if page != Page::Preview {
+            self.preview = None;
+        }
         self.page = page;
         self.selects.clear();
         self.scroll = 0;
@@ -634,12 +646,12 @@ impl App {
                 slot: index,
             });
         }
-        if matches!(self.page, Page::Edit(_)) {
-            if let Some(handle) = self.input.first() {
-                unsafe {
-                    SetFocus(*handle);
-                    SendMessageW(*handle, EM_SETSEL, 0, -1);
-                }
+        if matches!(self.page, Page::Edit(_))
+            && let Some(handle) = self.input.first()
+        {
+            unsafe {
+                SetFocus(*handle);
+                SendMessageW(*handle, EM_SETSEL, 0, -1);
             }
         }
     }
@@ -798,43 +810,43 @@ impl App {
 
     fn paint(&mut self) {
         let now = Local::now();
-        let conflict_ids = model::overlapping(&self.state.entries, self.day);
-        let week_start =
-            self.day - Duration::days(self.day.weekday().num_days_from_monday().into());
-        let week_end = week_start + Duration::days(6);
-        let all = if self.page == Page::Preview {
-            &self.preview
-        } else {
-            &self.state.entries
+        let entries = &self.state.entries;
+        let mut rows: Vec<_> = match self.page {
+            Page::Today => entries
+                .iter()
+                .filter(|(_, entry)| match entry.start {
+                    Some(start) => start.with_timezone(&Local).date_naive() == now.date_naive(),
+                    None => entry.kind == Kind::Task,
+                })
+                .map(|(&id, entry)| (id, entry))
+                .collect(),
+            Page::Tasks => entries
+                .iter()
+                .filter(|(_, entry)| entry.kind == Kind::Task)
+                .map(|(&id, entry)| (id, entry))
+                .collect(),
+            Page::Conflicts => {
+                let ids: std::collections::BTreeSet<_> =
+                    model::week_courses(entries, model::week_start(self.day))
+                        .into_iter()
+                        .flatten()
+                        .filter(|slot| slot.overlaps)
+                        .map(|slot| slot.id)
+                        .collect();
+                entries
+                    .iter()
+                    .filter(|(id, entry)| entry.conflict || ids.contains(id))
+                    .map(|(&id, entry)| (id, entry))
+                    .collect()
+            }
+            Page::Preview => self
+                .preview
+                .iter()
+                .flat_map(|preview| preview.entries.iter())
+                .map(|(&id, entry)| (id, entry))
+                .collect(),
+            _ => Vec::new(),
         };
-        let mut rows: Vec<_> = all
-            .iter()
-            .filter_map(|(&id, entry)| {
-                let date = entry
-                    .start
-                    .map(|start| start.with_timezone(&Local).date_naive());
-                let show = match self.page {
-                    Page::Today => {
-                        date == Some(now.date_naive()) || entry.kind == Kind::Task && date.is_none()
-                    }
-                    Page::Week => {
-                        entry.kind == Kind::Course
-                            && date.is_some_and(|date| {
-                                date <= week_end
-                                    && (date >= week_start
-                                        || entry.course_end().is_some_and(|end| {
-                                            end.with_timezone(&Local).date_naive() >= week_start
-                                        }))
-                            })
-                    }
-                    Page::Tasks => entry.kind == Kind::Task,
-                    Page::Conflicts => entry.conflict || conflict_ids.contains(&id),
-                    Page::Preview => true,
-                    _ => false,
-                };
-                show.then_some((id, entry))
-            })
-            .collect();
         rows.sort_by_key(|(_, entry)| (entry.done, entry.start.is_none(), entry.start));
         self.scroll = self.scroll.min(rows.len().saturating_sub(1));
         let next = if self.page == Page::Today {
@@ -880,17 +892,6 @@ impl App {
         } else {
             None
         };
-        let course_colors = if self.page == Page::Week {
-            ui::course_colors(
-                self.state
-                    .entries
-                    .values()
-                    .filter(|entry| entry.kind == Kind::Course)
-                    .map(|entry| entry.title.as_str()),
-            )
-        } else {
-            Default::default()
-        };
         let (hits, scrollbar) = ui::draw_main(
             self.main,
             dpi(self.main),
@@ -900,15 +901,17 @@ impl App {
                 active_page,
                 day: self.day,
                 rows: &rows,
-                course_colors: &course_colors,
+                entries,
                 next,
                 scroll: self.scroll,
                 week_scroll: self.week_scroll,
                 detail_scroll: self.detail_scroll,
+                conflict_scroll: self.conflict_scroll,
                 course,
                 status: &self.status,
                 sync_status,
                 connected: self.state.dav.is_some(),
+                syncing: self.job.is_some(),
                 startup: self.startup,
                 editing_course,
                 entry_times: self.entry_times,
@@ -919,15 +922,18 @@ impl App {
                 hover: self.hover,
                 semester: &semester_label,
             },
+            &mut self.week_cache,
         );
         self.main_hits = hits;
         self.scrollbar = scrollbar;
         if let Some(bar) = &self.scrollbar {
-            if self.page == Page::Week {
-                self.week_scroll = Some(bar.offset);
-            } else {
-                self.detail_scroll = bar.offset;
+            match self.page {
+                Page::Week => self.week_scroll = Some(bar.offset),
+                Page::Conflicts => self.conflict_scroll = bar.offset,
+                _ => self.detail_scroll = bar.offset,
             }
+        } else if self.page == Page::Conflicts {
+            self.conflict_scroll = 0;
         }
     }
 
@@ -938,7 +944,7 @@ impl App {
             && !is_ext(&path, "htm")
         {
             self.set_page(Page::Import);
-            self.status = "请选择 CSV 或 ICS 文件".into();
+            self.status = "请选择 CSV、HTML 或 ICS 文件".into();
             return;
         }
         self.import_file = Some(path.clone());
@@ -956,6 +962,7 @@ impl App {
     }
 
     fn open_preview(&mut self) -> Result<()> {
+        self.preview = None;
         let values = self.form_values();
         let path = values
             .first()
@@ -999,21 +1006,7 @@ impl App {
             }
         }
         let mut notes = String::new();
-        let campus_index = self.selects.first().copied().unwrap_or(0);
-        let (campus_label, campus) = *Campus::OPTIONS.get(campus_index).ok_or("请选择校区作息")?;
-        self.preview = if is_ext(&path, "csv") {
-            let monday = values
-                .get(1)
-                .and_then(|text| NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d").ok())
-                .filter(|date| (1900..=2200).contains(&date.year()))
-                .ok_or("请填写第一教学周的周一，格式 YYYY-MM-DD")?;
-            self.pending_semester = Some(Semester {
-                name: "西工大课程".into(),
-                first_monday: Some(monday),
-                campus: campus_label.into(),
-            });
-            import::csv(&bytes, monday, campus)?
-        } else if is_ext(&path, "ics") {
+        let preview = if is_ext(&path, "ics") {
             let calendar = import::ics(&bytes, Utc::now())?;
             if calendar.recurring {
                 notes = "重复事件展开至未来约 18 个月".into();
@@ -1024,24 +1017,37 @@ impl App {
                 }
                 notes.push_str(&format!("跳过 {} 个全天或无法解析的事件", calendar.skipped));
             }
-            calendar.entries
-        } else if is_ext(&path, "html") || is_ext(&path, "htm") {
-            let monday = self
-                .form_values()
+            ImportPreview {
+                entries: calendar.entries,
+                semester: None,
+            }
+        } else {
+            let parse = if is_ext(&path, "csv") {
+                import::csv
+            } else if is_ext(&path, "html") || is_ext(&path, "htm") {
+                import::html
+            } else {
+                return Err("请选择 CSV、HTML 或 ICS 文件".into());
+            };
+            let campus_index = self.selects.first().copied().unwrap_or(0);
+            let (campus_label, campus) =
+                *Campus::OPTIONS.get(campus_index).ok_or("请选择校区作息")?;
+            let monday = values
                 .get(1)
                 .and_then(|text| NaiveDate::parse_from_str(text.trim(), "%Y-%m-%d").ok())
                 .filter(|date| (1900..=2200).contains(&date.year()))
                 .ok_or("请填写第一教学周的周一，格式 YYYY-MM-DD")?;
-            self.pending_semester = Some(Semester {
-                name: "西工大课程".into(),
-                first_monday: Some(monday),
-                campus: campus_label.into(),
-            });
-            import::html(&bytes, monday, campus)?
-        } else {
-            return Err("请选择 CSV 或 ICS 文件".into());
+            ImportPreview {
+                entries: parse(&bytes, monday, campus)?,
+                semester: Some(Semester {
+                    name: "西工大课程".into(),
+                    first_monday: Some(monday),
+                    campus: campus_label.into(),
+                }),
+            }
         };
         self.import_file = Some(source_path);
+        self.preview = Some(preview);
         self.set_page(Page::Preview);
         self.status = notes;
         Ok(())
@@ -1124,50 +1130,42 @@ impl App {
         }
         let mut entries = self.state.entries.clone();
         entries.insert(id.unwrap_or_else(Uuid::new_v4), entry);
-        self.commit(entries)?;
+        self.commit(entries, None)?;
         self.set_page(self.return_page);
         self.status = "已保存".into();
         Ok(())
     }
 
-    fn commit(&mut self, entries: Entries) -> Result<()> {
+    fn commit(&mut self, entries: Entries, semester: Option<Semester>) -> Result<()> {
         let mut state = self.state.clone();
         state.update_entries(entries);
+        if let Some(semester) = semester {
+            state.update_semester(semester);
+        }
+        self.save_state(state)?;
+        self.sync_due = self
+            .state
+            .dav
+            .as_ref()
+            .map(|_| Utc::now() + Duration::seconds(3));
+        self.tick();
+        Ok(())
+    }
+
+    fn save_state(&mut self, state: State) -> Result<()> {
         model::save(&self.path, &state)?;
+        if state.entries != self.state.entries {
+            self.week_cache = WeekCache::default();
+        }
         self.state = state;
         self.save_retry = None;
-        if self.state.dav.is_some() {
-            self.sync_due = Some(Utc::now() + Duration::seconds(3));
-        }
-        self.tick();
         Ok(())
     }
 
     fn toggle_entry(&mut self, id: Uuid) -> Result<()> {
         let mut entries = self.state.entries.clone();
-        if let Some(entry) = entries.get_mut(&id) {
-            entry.done = !entry.done;
-            let next = if entry.done {
-                entry.repeat.and_then(|repeat| {
-                    let start = entry.start?;
-                    let mut next = entry.clone();
-                    next.start = Some(repeat.next(start));
-                    next.end = entry
-                        .end
-                        .and_then(|end| end.checked_add_signed(next.start.unwrap() - start));
-                    next.done = false;
-                    next.conflict = false;
-                    Some((Uuid::new_v4(), next))
-                })
-            } else {
-                None
-            };
-            self.commit(entries)?;
-            if let Some((next_id, next_entry)) = next {
-                let mut entries = self.state.entries.clone();
-                entries.insert(next_id, next_entry);
-                self.commit(entries)?;
-            }
+        if model::toggle_task(&mut entries, id) {
+            self.commit(entries, None)?;
             if self.page == Page::Edit(Some(id)) {
                 self.navigate(Page::Edit(Some(id)));
             }
@@ -1206,6 +1204,7 @@ impl App {
         let mut state = self.state.clone();
         if self.state.dav.as_ref().is_none_or(|old| old.url != url) {
             state.base.clear();
+            state.base_semester = None;
             state.dav_verified = false;
         }
         state.dav = Some(DavSettings {
@@ -1229,6 +1228,7 @@ impl App {
         state.dav = None;
         state.dav_verified = false;
         state.base.clear();
+        state.base_semester = None;
         model::save(&self.path, &state)?;
         self.state = state;
         self.sync_due = None;
@@ -1251,17 +1251,32 @@ impl App {
         let sent = self.state.entries.clone();
         let local = sent.clone();
         let semester = self.state.semester.clone();
+        let local_semester = semester.clone();
+        let base_semester = self.state.base_semester.clone();
         let (tx, result) = mpsc::channel();
         let window = self.controller as usize;
         match std::thread::Builder::new()
             .name("course-clock-dav".into())
             .spawn(move || {
-                let _ = tx.send(sync::sync(&settings, verified, &base, &local, &semester));
+                let _ = tx.send(sync::sync(
+                    &settings,
+                    verified,
+                    &base,
+                    &local,
+                    &local_semester,
+                    base_semester.as_ref(),
+                ));
                 unsafe {
                     PostMessageW(window as HWND, SYNC_DONE, 0, 0);
                 }
             }) {
-            Ok(_) => self.job = Some(SyncJob { sent, result }),
+            Ok(_) => {
+                self.job = Some(SyncJob {
+                    sent,
+                    semester,
+                    result,
+                })
+            }
             Err(error) => {
                 self.sync_status = format!("无法启动同步：{error}");
                 self.sync_due = Some(Utc::now() + Duration::minutes(1));
@@ -1290,18 +1305,19 @@ impl App {
                 let mut state = self.state.clone();
                 state.update_entries(entries);
                 state.base = remote.entries;
-                if let Some(semester) = remote.semester {
-                    state.semester = semester;
+                if job.semester == state.semester {
+                    state.semester = remote.semester.clone();
                 }
+                state.base_semester = Some(remote.semester);
                 state.dav_verified = true;
-                if let Err(error) = model::save(&self.path, &state) {
+                let needs_sync = state.entries != state.base
+                    || state.base_semester.as_ref() != Some(&state.semester);
+                if let Err(error) = self.save_state(state) {
                     error
                 } else {
-                    if state.entries != state.base {
+                    if needs_sync {
                         self.sync_due = Some(Utc::now() + Duration::seconds(3));
                     }
-                    self.state = state;
-                    self.save_retry = None;
                     let time = Local::now().format("%H:%M");
                     let conflicts = remote.conflicts + rebase_conflicts;
                     if conflicts > 0 {
@@ -1586,12 +1602,15 @@ impl App {
             }
             Action::ParseImport => self.open_preview()?,
             Action::CommitImport => {
+                let Some(preview) = &self.preview else {
+                    return Ok(());
+                };
                 let mut entries = self.state.entries.clone();
                 let stale: Vec<Uuid> = entries
                     .iter()
                     .filter(|(_, old)| {
                         old.kind == Kind::Course
-                            && self.preview.values().any(|fresh| {
+                            && preview.entries.values().any(|fresh| {
                                 fresh.start == old.start
                                     && old.title != fresh.title
                                     && old.title.trim_start_matches("研究生").trim()
@@ -1604,7 +1623,7 @@ impl App {
                     entries.remove(id);
                 }
                 let mut count = 0;
-                for (&id, source) in &self.preview {
+                for (&id, source) in &preview.entries {
                     let mut entry = source.clone();
                     if let Some(old) = entries.get(&id) {
                         entry.lead = old.lead;
@@ -1613,12 +1632,7 @@ impl App {
                         count += 1;
                     }
                 }
-                self.commit(entries)?;
-                if let Some(semester) = self.pending_semester.take() {
-                    self.state.semester = semester;
-                    model::save(&self.path, &self.state)?;
-                }
-                self.preview.clear();
+                self.commit(entries, preview.semester.clone())?;
                 self.day = self.app_date;
                 self.week_scroll = None;
                 self.set_page(Page::Week);
@@ -1635,7 +1649,7 @@ impl App {
                 }
                 let mut entries = self.state.entries.clone();
                 entries.remove(&id);
-                self.commit(entries)?;
+                self.commit(entries, None)?;
                 let return_page = if self.return_page == Page::Course(id) {
                     self.course_origin
                 } else {
@@ -1653,23 +1667,35 @@ impl App {
                 );
             }
             Action::Restore => {
+                if self.job.is_some() {
+                    return Err("正在同步，请在同步完成后恢复备份".into());
+                }
                 let backup = win::pick_backup(self.main)?;
+                if !backup.is_file() {
+                    return Err("找不到备份文件".into());
+                }
                 let restored = model::open_state(&backup)?;
                 if restored.entries.values().any(|entry| !entry.validates()) {
                     return Err("备份中存在无效记录，已停止恢复".into());
                 }
                 let _ = model::backup(&self.path, &self.state)?;
-                model::save(&self.path, &restored)?;
-                self.state = restored;
+                self.save_state(restored)?;
+                self.sync_due = self
+                    .state
+                    .dav
+                    .as_ref()
+                    .map(|_| Utc::now() + Duration::seconds(3));
+                self.sync_status.clear();
                 self.status = "已恢复备份，原数据已另存为备份".into();
                 self.rebuild_form();
+                self.tick();
             }
             Action::ResolveConflict(id) => {
                 let mut entries = self.state.entries.clone();
                 if let Some(entry) = entries.get_mut(&id) {
                     entry.conflict = false;
                 }
-                self.commit(entries)?;
+                self.commit(entries, None)?;
             }
             Action::Disconnect => self.disconnect()?,
             Action::Sync => self.start_sync(),
@@ -1749,9 +1775,10 @@ impl App {
     }
 
     fn select_day(&mut self, day: NaiveDate) {
-        let monday = self.day - Duration::days(self.day.weekday().num_days_from_monday().into());
+        let monday = model::week_start(self.day);
         if !(monday..monday + Duration::days(7)).contains(&day) {
             self.week_scroll = None;
+            self.conflict_scroll = 0;
         }
         self.day = day;
     }
@@ -1762,6 +1789,7 @@ impl App {
         match self.page {
             Page::Week => self.week_scroll = Some(offset),
             Page::Course(_) => self.detail_scroll = offset,
+            Page::Conflicts => self.conflict_scroll = offset,
             _ => return,
         }
         self.repaint();
@@ -2007,7 +2035,10 @@ unsafe extern "system" fn controller(hwnd: HWND, message: u32, w: WPARAM, l: LPA
             with_app(App::tick);
         }
         WM_TIMECHANGE => {
-            with_app(App::tick);
+            with_app(|app| {
+                app.week_cache = WeekCache::default();
+                app.tick();
+            });
         }
         WM_POWERBROADCAST => {
             if w == PBT_APMRESUMEAUTOMATIC as usize || w == PBT_APMRESUMESUSPEND as usize {
@@ -2441,10 +2472,10 @@ fn drag_scroll(pos: LPARAM) -> bool {
 fn scroll(delta: i32, by_page: bool) {
     with_app(|app| {
         if let Some(bar) = &app.scrollbar {
-            let position = if app.page == Page::Week {
-                app.week_scroll.unwrap_or(bar.offset)
-            } else {
-                app.detail_scroll
+            let position = match app.page {
+                Page::Week => app.week_scroll.unwrap_or(bar.offset),
+                Page::Conflicts => app.conflict_scroll,
+                _ => app.detail_scroll,
             };
             let step = if by_page {
                 (bar.page_height - 24).max(1)

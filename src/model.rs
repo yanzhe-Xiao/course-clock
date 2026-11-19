@@ -6,7 +6,7 @@ use std::{
 };
 
 use chrono::{
-    DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc, Weekday,
+    DateTime, Datelike, Duration, Local, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc, Weekday,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -85,6 +85,33 @@ impl Default for Semester {
     }
 }
 
+fn merge_value<T: Clone + PartialEq>(base: &T, local: &T, remote: &T) -> T {
+    if local == remote || remote == base {
+        local.clone()
+    } else {
+        remote.clone()
+    }
+}
+
+pub fn merge_semester(base: Option<&Semester>, local: &Semester, remote: &Semester) -> Semester {
+    let Some(base) = base else {
+        return if *remote == Semester::default() {
+            local.clone()
+        } else {
+            remote.clone()
+        };
+    };
+    Semester {
+        name: merge_value(&base.name, &local.name, &remote.name),
+        first_monday: merge_value(
+            &base.first_monday,
+            &local.first_monday,
+            &remote.first_monday,
+        ),
+        campus: merge_value(&base.campus, &local.campus, &remote.campus),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub kind: Kind,
@@ -105,7 +132,7 @@ pub struct Entry {
 impl Entry {
     pub fn course_end(&self) -> Option<DateTime<Utc>> {
         self.end
-            .or_else(|| self.start.map(|start| start + Duration::minutes(45)))
+            .or_else(|| self.start?.checked_add_signed(Duration::minutes(45)))
     }
 
     pub fn validates(&self) -> bool {
@@ -165,6 +192,8 @@ pub struct Alarm {
 pub struct State {
     pub entries: Entries,
     pub base: Entries,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_semester: Option<Semester>,
     pub alarms: BTreeMap<Uuid, Alarm>,
     pub dav: Option<DavSettings>,
     pub dav_verified: bool,
@@ -197,6 +226,48 @@ impl State {
         });
         self.entries = entries;
     }
+
+    pub fn update_semester(&mut self, semester: Semester) {
+        if self.dav_verified && self.base_semester.is_none() && self.semester != semester {
+            // Before the baseline was stored, successful sync adopted the remote semester.
+            self.base_semester = Some(self.semester.clone());
+        }
+        self.semester = semester;
+    }
+}
+
+pub fn toggle_task(entries: &mut Entries, id: Uuid) -> bool {
+    let Some(next) = ({
+        let Some(entry) = entries.get_mut(&id) else {
+            return false;
+        };
+        entry.done = !entry.done;
+        if entry.done {
+            entry.repeat.zip(entry.start).map(|(repeat, start)| {
+                let mut next = entry.clone();
+                let next_start = repeat.next(start);
+                next.start = Some(next_start);
+                next.end = entry
+                    .end
+                    .and_then(|end| end.checked_add_signed(next_start - start));
+                next.done = false;
+                next.conflict = false;
+                next
+            })
+        } else {
+            None
+        }
+    }) else {
+        return true;
+    };
+    let next_id = Uuid::new_v5(&id, b"course-clock:next-repeat");
+    let already_exists = entries.iter().any(|(&candidate_id, candidate)| {
+        candidate_id != id && !candidate.done && candidate == &next
+    });
+    if !already_exists {
+        entries.entry(next_id).or_insert(next);
+    }
+    true
 }
 
 pub fn local_time(text: &str) -> Result<DateTime<Utc>> {
@@ -280,33 +351,63 @@ fn merge_entry(before: Option<&Entry>, ours: &Entry, theirs: &Entry) -> Option<E
     entry.validates().then_some(entry)
 }
 
-pub fn overlapping(entries: &Entries, date: NaiveDate) -> BTreeSet<Uuid> {
-    let mut ids = BTreeSet::new();
-    let mut courses: Vec<_> = entries
+pub fn week_start(date: NaiveDate) -> NaiveDate {
+    date - Duration::days(date.weekday().num_days_from_monday().into())
+}
+
+pub struct CourseSlot {
+    pub id: Uuid,
+    pub start: i32,
+    pub end: i32,
+    pub overlaps: bool,
+}
+
+pub fn week_courses(entries: &Entries, monday: NaiveDate) -> [Vec<CourseSlot>; 7] {
+    const DAY_SECONDS: i32 = 86_400;
+    let mut days: [Vec<CourseSlot>; 7] = std::array::from_fn(|_| Vec::new());
+    for (&id, entry) in entries
         .iter()
-        .filter_map(|(id, entry)| {
-            let start = entry.start?;
-            let local = start.with_timezone(&Local);
-            (entry.kind == Kind::Course && local.date_naive() == date).then_some((
-                *id,
-                start,
-                entry.course_end()?,
-            ))
-        })
-        .collect();
-    courses.sort_by_key(|(_, start, _)| *start);
-    for (index, (left_id, left_start, left_end)) in courses.iter().enumerate() {
-        for (right_id, right_start, right_end) in courses.iter().skip(index + 1) {
-            if *right_start >= *left_end {
-                break;
+        .filter(|(_, entry)| entry.kind == Kind::Course)
+    {
+        let (Some(start), Some(end)) = (entry.start, entry.course_end()) else {
+            continue;
+        };
+        let (start, end) = (start.with_timezone(&Local), end.with_timezone(&Local));
+        let first = (start.date_naive() - monday).num_days();
+        let last = (end.date_naive() - monday).num_days();
+        for day in first.max(0)..=last.min(6) {
+            let start_second = if day == first {
+                start.num_seconds_from_midnight() as i32
+            } else {
+                0
+            };
+            let end_second = if day == last {
+                end.num_seconds_from_midnight() as i32
+            } else {
+                DAY_SECONDS
+            };
+            if day == last && day != first && end_second == 0 {
+                continue;
             }
-            if *right_start < *left_end && *left_start < *right_end {
-                ids.insert(*left_id);
-                ids.insert(*right_id);
-            }
+            days[day as usize].push(CourseSlot {
+                id,
+                start: start_second,
+                end: end_second.max(start_second + 1),
+                overlaps: false,
+            });
         }
     }
-    ids
+    for slots in &mut days {
+        slots.sort_by_key(|slot| (slot.start, slot.end, slot.id));
+        let mut latest_end = 0;
+        for index in 0..slots.len() {
+            let next_start = slots.get(index + 1).map_or(DAY_SECONDS, |next| next.start);
+            let slot = &mut slots[index];
+            slot.overlaps = slot.start < latest_end || next_start < slot.end;
+            latest_end = latest_end.max(slot.end);
+        }
+    }
+    days
 }
 
 pub fn data_dir() -> Result<PathBuf> {
@@ -391,6 +492,21 @@ pub fn backup(path: &Path, state: &State) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    fn task(repeat: RepeatRule) -> Entry {
+        Entry {
+            kind: Kind::Task,
+            title: "周期任务".into(),
+            teacher: String::new(),
+            place: String::new(),
+            start: Some("2026-11-18T09:00:00Z".parse().unwrap()),
+            end: None,
+            lead: Some(10),
+            done: false,
+            repeat: Some(repeat),
+            conflict: false,
+        }
+    }
+
     fn course(start: &str, end: &str) -> Entry {
         Entry {
             kind: Kind::Course,
@@ -419,8 +535,90 @@ mod tests {
             second,
             course("2026-11-18T01:45:00Z", "2026-11-18T03:00:00Z"),
         );
-        let ids = overlapping(&entries, NaiveDate::from_ymd_opt(2026, 11, 18).unwrap());
-        assert_eq!(ids, BTreeSet::from([first, second]));
+        let monday = week_start(NaiveDate::from_ymd_opt(2026, 11, 18).unwrap());
+        let overlaps: BTreeSet<_> = week_courses(&entries, monday)
+            .into_iter()
+            .flatten()
+            .filter(|slot| slot.overlaps)
+            .map(|slot| slot.id)
+            .collect();
+        assert_eq!(overlaps, BTreeSet::from([first, second]));
+    }
+
+    #[test]
+    fn overnight_course_overlaps_the_next_days_course() {
+        let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        let local_time = |text| {
+            local_datetime(NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M").unwrap()).unwrap()
+        };
+        let mut entries = Entries::new();
+        let overnight = Uuid::new_v4();
+        let next_day = Uuid::new_v4();
+        let mut overnight_entry = course("2026-11-17T15:30:00Z", "2026-11-17T16:30:00Z");
+        overnight_entry.start = Some(local_time("2026-11-17 23:30"));
+        overnight_entry.end = Some(local_time("2026-11-18 00:30"));
+        entries.insert(overnight, overnight_entry);
+        let mut next_day_entry = course("2026-11-18T01:00:00Z", "2026-11-18T02:00:00Z");
+        next_day_entry.start = Some(local_time("2026-11-18 00:15"));
+        next_day_entry.end = Some(local_time("2026-11-18 01:00"));
+        entries.insert(next_day, next_day_entry);
+        let overlaps: BTreeSet<_> = week_courses(&entries, monday)
+            .into_iter()
+            .flatten()
+            .filter(|slot| slot.overlaps)
+            .map(|slot| slot.id)
+            .collect();
+        assert_eq!(overlaps, BTreeSet::from([overnight, next_day]));
+    }
+
+    #[test]
+    fn repeating_task_completion_is_atomic_and_idempotent() {
+        let id = Uuid::new_v4();
+        let mut entries = Entries::from([(id, task(RepeatRule::Daily))]);
+        assert!(toggle_task(&mut entries, id));
+        let next = Uuid::new_v5(&id, b"course-clock:next-repeat");
+        let next_entry = entries[&next].clone();
+        assert!(toggle_task(&mut entries, id));
+        assert!(toggle_task(&mut entries, id));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[&next], next_entry);
+    }
+
+    #[test]
+    fn repeating_task_completion_reuses_legacy_next_occurrence() {
+        let id = Uuid::new_v4();
+        let legacy_next_id = Uuid::new_v4();
+        let mut entries = Entries::from([(id, task(RepeatRule::Daily))]);
+        let mut legacy_next = task(RepeatRule::Daily);
+        legacy_next.start = Some(RepeatRule::Daily.next(entries[&id].start.unwrap()));
+        entries.insert(legacy_next_id, legacy_next.clone());
+        toggle_task(&mut entries, id);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[&legacy_next_id], legacy_next);
+    }
+
+    #[test]
+    fn semester_merge_keeps_local_changes_since_the_baseline() {
+        let base = Semester::default();
+        let remote = Semester {
+            name: "远端学期".into(),
+            first_monday: None,
+            campus: base.campus.clone(),
+        };
+        let local = Semester {
+            name: "本地学期".into(),
+            first_monday: NaiveDate::from_ymd_opt(2026, 8, 31),
+            campus: base.campus.clone(),
+        };
+        assert_eq!(
+            merge_semester(Some(&base), &local, &remote),
+            Semester {
+                name: remote.name,
+                first_monday: local.first_monday,
+                campus: base.campus.clone(),
+            }
+        );
+        assert_eq!(merge_semester(Some(&base), &local, &base), local);
     }
 
     #[test]
